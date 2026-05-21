@@ -312,7 +312,7 @@ class HuldraBroker:
     def _try_compose_cached_id_list(self, request: ArxivRequest, cache_key: str) -> ArxivResult | None:
         if not _is_pure_id_list_request(request):
             return None
-        ids = tuple(normalize_arxiv_id(value) for value in request.id_list)
+        ids = tuple(dict.fromkeys(normalize_arxiv_id(value) for value in request.id_list))
         papers_by_id = self.store.get_papers_by_ids(ids)
         if any(arxiv_id not in papers_by_id for arxiv_id in ids):
             return None

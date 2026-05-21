@@ -373,7 +373,7 @@ class HuldraWorker:
     def _plan_id_list_fetch(self, item: QueueItem) -> _IdListFetchPlan | None:
         if item.work_kind != QueueWorkKind.FETCH_MISSING or not _is_pure_id_list_request(item.request):
             return None
-        requested_ids = tuple(normalize_arxiv_id(value) for value in item.request.id_list)
+        requested_ids = tuple(dict.fromkeys(normalize_arxiv_id(value) for value in item.request.id_list))
         papers_by_id = self.store.get_papers_by_ids(requested_ids)
         missing = tuple(arxiv_id for arxiv_id in requested_ids if arxiv_id not in papers_by_id)
         if not missing:

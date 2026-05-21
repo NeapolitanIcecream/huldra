@@ -55,6 +55,23 @@ def test_pure_id_list_can_be_composed_from_paper_cache_in_request_order(
     assert store.status_summary().queue_depth_total == 0
 
 
+def test_pure_id_list_composition_ignores_repeated_ids_when_writing_cache(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: repeated IDs produced duplicate cache_matches rows."""
+    store.upsert_papers([make_paper("2401.00001v1")])
+    request = ArxivRequest(client_id="demo", id_list=("2401.00001v1", "2401.00001v1"))
+
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert result.status == "ready"
+    assert result.cache_hit
+    assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
+    assert result.papers_total == 1
+    assert result.cached_papers_total == 1
+
+
 def test_id_list_worker_fetches_only_missing_ids_and_records_full_cache(
     store: HuldraStore,
     settings: HuldraSettings,
@@ -81,6 +98,32 @@ def test_id_list_worker_fetches_only_missing_ids_and_records_full_cache(
     assert result.status == "ready"
     assert queued.request_id is not None
     assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1", "2401.00002v1"]
+
+
+def test_id_list_worker_deduplicates_repeated_ids_before_composed_cache_write(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: repeated IDs in worker-composed caches violated cache_matches uniqueness."""
+    request = ArxivRequest(
+        client_id="demo",
+        id_list=("2401.00001v1", "2401.00001v1"),
+        cache_policy=CachePolicy.WAIT_UNTIL_READY,
+    )
+    store.enqueue_request(request)
+    fetcher = CapturingFetcher(
+        responses=[FetchResult([make_paper("2401.00001v1")], total_results=1)],
+        seen=[],
+    )
+
+    worker_result = HuldraWorker(store, settings, fetcher=fetcher, sleep=lambda _: None).run_once()
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert worker_result.status == "completed"
+    assert worker_result.papers_total == 1
+    assert [seen.id_list for seen in fetcher.seen] == [("2401.00001v1",)]
+    assert result.status == "ready"
+    assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
 
 
 def test_reordered_cold_id_list_requests_do_not_duplicate_upstream_fetches(
