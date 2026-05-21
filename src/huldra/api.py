@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
+from huldra.keys import normalize_arxiv_id
 from huldra.models import (
     ArxivPaper,
     ArxivRequest,
@@ -50,9 +51,9 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
     def get_result(cache_key: str) -> ArxivResult:
         return broker.get_result(cache_key)
 
-    @app.get("/v1/papers/{arxiv_id}", response_model=ArxivPaper | None)
+    @app.get("/v1/papers/{arxiv_id:path}", response_model=ArxivPaper | None)
     def get_paper(arxiv_id: str) -> ArxivPaper | None:
-        paper = store.get_paper(arxiv_id)
+        paper = store.get_paper(normalize_arxiv_id(arxiv_id))
         if paper is None:
             raise HTTPException(status_code=404, detail="paper not found")
         return paper

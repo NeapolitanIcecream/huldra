@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import TracebackType
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -92,7 +93,8 @@ class HuldraClient:
         return ArxivResult.model_validate(self._json(self._client.get(f"/v1/results/{cache_key}")))
 
     def get_paper(self, arxiv_id: str) -> ArxivPaper | None:
-        response = self._client.get(f"/v1/papers/{arxiv_id}")
+        encoded = quote(arxiv_id, safe="")
+        response = self._client.get(f"/v1/papers/{encoded}")
         if response.status_code == 404:
             return None
         return ArxivPaper.model_validate(self._json(response))

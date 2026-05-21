@@ -47,6 +47,27 @@ def test_api_get_result_and_paper_from_completed_cache(
     assert client.get("/v1/papers/2401.00001v1").json()["title"] == "Test Paper"
 
 
+def test_api_get_paper_supports_old_style_arxiv_id_with_slash(
+    settings: HuldraSettings,
+) -> None:
+    store = HuldraStore(settings.db_path)
+    store.init_schema()
+    paper = make_paper("hep-th/9901001v1")
+    request = ArxivRequest(client_id="api", id_list=("hep-th/9901001v1",))
+    store.record_completed_cache_entry(
+        cache_key=request_cache_key(request),
+        request=request,
+        papers=[paper],
+    )
+
+    client = TestClient(create_app(settings))
+
+    assert client.get("/v1/papers/hep-th/9901001v1").status_code == 200
+    encoded = client.get("/v1/papers/hep-th%2F9901001v1")
+    assert encoded.status_code == 200
+    assert encoded.json()["arxiv_id"] == "hep-th/9901001v1"
+
+
 def test_api_serializes_cooldown_status(settings: HuldraSettings) -> None:
     store = HuldraStore(settings.db_path)
     store.init_schema()
