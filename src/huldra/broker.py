@@ -35,7 +35,12 @@ class HuldraBroker:
         cache_key = request_cache_key(request)
         cached = self.store.get_cache_entry(cache_key)
         if cached and cached.status == "completed":
-            result = self._result_from_completed_cache(cache_key, cached, cache_hit=True)
+            result = self._result_from_completed_cache(
+                cache_key,
+                cached,
+                cache_hit=True,
+                readiness_request=request,
+            )
             if request.cache_policy == CachePolicy.STALE_WHILE_REVALIDATE:
                 item = self.store.enqueue_request(request, cache_key)
                 return result.model_copy(
@@ -113,6 +118,7 @@ class HuldraBroker:
                     entry,
                     cache_hit=True,
                     request_id=request_id,
+                    readiness_request=request,
                 )
             if entry and entry.status in {"failed", "rate_limited"}:
                 return self.get_result(cache_key).model_copy(update={"request_id": request_id})
@@ -132,9 +138,10 @@ class HuldraBroker:
         *,
         cache_hit: bool,
         request_id: str | None = None,
+        readiness_request: ArxivRequest | None = None,
     ) -> ArxivResult:
         papers = self.store.get_cached_papers(cache_key)
-        readiness = _evaluate_readiness(entry.request, self.settings)
+        readiness = _evaluate_readiness(readiness_request or entry.request, self.settings)
         status = "ready" if readiness.analysis_ready else "immature"
         return ArxivResult(
             status=status,

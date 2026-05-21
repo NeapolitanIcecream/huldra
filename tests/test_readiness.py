@@ -73,3 +73,60 @@ def test_id_list_completed_cache_marks_maturity_not_applicable(
     result = HuldraBroker(store=store, settings=settings).ensure(request)
     assert result.status == "ready"
     assert not result.maturity_applicable
+
+
+def test_analysis_ready_request_uses_caller_readiness_on_raw_cache_hit(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    raw_request = ArxivRequest(
+        client_id="raw",
+        search_query="cat:cs.AI",
+        submitted_start=today,
+        submitted_end=today + timedelta(days=1),
+        readiness=ReadinessMode.RAW_COMPLETED,
+    )
+    analysis_request = raw_request.model_copy(
+        update={
+            "client_id": "analysis",
+            "readiness": ReadinessMode.ANALYSIS_READY,
+        }
+    )
+    _record(store, raw_request)
+
+    result = HuldraBroker(store=store, settings=settings).ensure(analysis_request)
+
+    assert result.status == "immature"
+    assert result.ready
+    assert not result.analysis_ready
+    assert result.maturity_applicable
+    assert result.blocked_reason == "immature_window"
+
+
+def test_raw_completed_request_can_use_analysis_ready_cache_without_maturity_gate(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    analysis_request = ArxivRequest(
+        client_id="analysis",
+        search_query="cat:cs.AI",
+        submitted_start=today,
+        submitted_end=today + timedelta(days=1),
+        readiness=ReadinessMode.ANALYSIS_READY,
+    )
+    raw_request = analysis_request.model_copy(
+        update={
+            "client_id": "raw",
+            "readiness": ReadinessMode.RAW_COMPLETED,
+        }
+    )
+    _record(store, analysis_request)
+
+    result = HuldraBroker(store=store, settings=settings).ensure(raw_request)
+
+    assert result.status == "ready"
+    assert result.ready
+    assert result.analysis_ready
+    assert not result.maturity_applicable
