@@ -582,6 +582,8 @@ class HuldraStore:
         *,
         name: str = "default",
         next_wake_at: datetime | None = None,
+        error_category: str | None = None,
+        error_message: str | None = None,
         now: datetime | None = None,
     ) -> None:
         timestamp = isoformat_or_none(now or utc_now())
@@ -590,14 +592,26 @@ class HuldraStore:
         with self.begin_immediate() as conn:
             conn.execute(
                 """
-                INSERT INTO worker_state(name, last_completed_at, last_heartbeat_at, next_wake_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO worker_state(
+                    name, last_completed_at, last_heartbeat_at, next_wake_at,
+                    last_error_category, last_error_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     last_completed_at=excluded.last_completed_at,
                     last_heartbeat_at=excluded.last_heartbeat_at,
-                    next_wake_at=excluded.next_wake_at
+                    next_wake_at=excluded.next_wake_at,
+                    last_error_category=excluded.last_error_category,
+                    last_error_message=excluded.last_error_message
                 """,
-                (name, timestamp, timestamp, next_wake),
+                (
+                    name,
+                    timestamp,
+                    timestamp,
+                    next_wake,
+                    error_category,
+                    error_message[:1000] if error_message else None,
+                ),
             )
             self._record_event_conn(conn, "worker_stop", {"name": name})
 
@@ -636,7 +650,12 @@ class HuldraStore:
             papers = conn.execute("SELECT COUNT(*) AS total FROM papers").fetchone()
             worker = conn.execute(
                 """
-                SELECT last_heartbeat_at, next_wake_at FROM worker_state
+                SELECT
+                    last_heartbeat_at,
+                    next_wake_at,
+                    last_error_category,
+                    last_error_message
+                FROM worker_state
                 ORDER BY last_heartbeat_at DESC
                 LIMIT 1
                 """
@@ -657,7 +676,15 @@ class HuldraStore:
             worker_last_heartbeat_at=(
                 from_isoformat_or_none(worker["last_heartbeat_at"]) if worker else None
             ),
-            worker_next_wake_at=(from_isoformat_or_none(worker["next_wake_at"]) if worker else None),
+            worker_next_wake_at=(
+                from_isoformat_or_none(worker["next_wake_at"]) if worker else None
+            ),
+            worker_last_error_category=(
+                worker["last_error_category"] if worker else None
+            ),
+            worker_last_error_message=(
+                worker["last_error_message"] if worker else None
+            ),
             oldest_pending_request_at=from_isoformat_or_none(queue["oldest"]),
         )
 

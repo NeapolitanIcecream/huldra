@@ -171,6 +171,8 @@ class BrokerStatus(HuldraModel):
     papers_total: int = 0
     worker_last_heartbeat_at: datetime | None = None
     worker_next_wake_at: datetime | None = None
+    worker_last_error_category: str | None = None
+    worker_last_error_message: str | None = None
     oldest_pending_request_at: datetime | None = None
 
 

@@ -87,6 +87,7 @@ class HuldraWorker:
         cached = self.store.get_cache_entry(item.cache_key)
         if cached is not None and cached.status == "completed":
             self.store.complete_queue_item(item.request_id)
+            self.store.record_worker_completed(name=self.name)
             return WorkerPassResult(
                 status="cache_hit",
                 request_id=item.request_id,
@@ -102,6 +103,12 @@ class HuldraWorker:
             self.store.release_or_delay_queue_item(
                 item.request_id,
                 next_attempt_at=next_attempt,
+                error_category=decision.blocked_reason,
+                error_message=decision.blocked_reason,
+            )
+            self.store.record_worker_completed(
+                name=self.name,
+                next_wake_at=next_attempt,
                 error_category=decision.blocked_reason,
                 error_message=decision.blocked_reason,
             )
@@ -137,6 +144,12 @@ class HuldraWorker:
                 error_category="rate_limited",
                 error_message=str(exc),
             )
+            self.store.record_worker_completed(
+                name=self.name,
+                next_wake_at=cooldown_until,
+                error_category="rate_limited",
+                error_message=str(exc),
+            )
             log.bind(cache_key=item.cache_key, cooldown_until=cooldown_until.isoformat()).warning(
                 "fetch_rate_limited"
             )
@@ -168,6 +181,12 @@ class HuldraWorker:
                 error_category="transient",
                 error_message=str(exc),
             )
+            self.store.record_worker_completed(
+                name=self.name,
+                next_wake_at=next_attempt,
+                error_category="transient",
+                error_message=str(exc),
+            )
             log.bind(cache_key=item.cache_key, status_code=exc.status_code).warning("fetch_transient_failure")
             return WorkerPassResult(
                 status="transient_failure",
@@ -195,6 +214,11 @@ class HuldraWorker:
                 error_category="non_retryable",
                 error_message=str(exc),
             )
+            self.store.record_worker_completed(
+                name=self.name,
+                error_category="non_retryable",
+                error_message=str(exc),
+            )
             return WorkerPassResult(
                 status="failed",
                 request_id=item.request_id,
@@ -206,6 +230,11 @@ class HuldraWorker:
             self.limiter.after_failure(
                 owner_token=self.owner_token,
                 status=exc.status_code,
+                error_message=str(exc),
+            )
+            self.store.record_worker_completed(
+                name=self.name,
+                error_category="fetch_error",
                 error_message=str(exc),
             )
             raise
