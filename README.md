@@ -43,6 +43,15 @@ Run a foreground worker in a separate terminal:
 uv run huldra worker --db ~/.local/share/huldra/huldra.db --poll-interval-seconds 300 --json
 ```
 
+Check status:
+
+```bash
+uv run huldra status --db ~/.local/share/huldra/huldra.db --json
+```
+
+Status includes queue depth, cache totals, durable upstream 429 totals,
+cooldown state, worker heartbeat, worker next wake, and the last worker error.
+
 The API binds to `127.0.0.1` by default. Do not expose it to a public network
 without a reverse proxy and authentication.
 
