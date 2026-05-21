@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
@@ -88,6 +88,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             last_request_at TEXT,
             cooldown_until TEXT,
             consecutive_429_total INTEGER NOT NULL DEFAULT 0,
+            upstream_429_total INTEGER NOT NULL DEFAULT 0,
             last_status INTEGER,
             last_error_message TEXT
         );
@@ -117,8 +118,29 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_rate_state_upstream_429_total(conn)
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))"
+    )
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
         (SCHEMA_VERSION,),
     )
     conn.commit()
+
+
+def _ensure_rate_state_upstream_429_total(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(rate_state)").fetchall()
+    }
+    if "upstream_429_total" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE rate_state ADD COLUMN upstream_429_total INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute(
+        """
+        UPDATE rate_state
+        SET upstream_429_total = MAX(upstream_429_total, consecutive_429_total)
+        """
+    )

@@ -56,3 +56,20 @@ def test_after_429_persists_cooldown(
     cooldown = limiter.after_429(owner_token="w1", retry_after_seconds=10, now=now)
     assert cooldown == now + timedelta(seconds=10)
     assert store.get_rate_state().cooldown_until == cooldown
+
+
+def test_upstream_429_total_survives_success_after_cooldown(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    limiter = HuldraRateLimiter(store, settings)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    limiter.after_429(owner_token="w1", retry_after_seconds=10, now=now)
+
+    assert store.status_summary(now=now).upstream_429_total == 1
+
+    limiter.after_success(owner_token="w1", now=now + timedelta(seconds=11))
+
+    assert store.status_summary(now=now + timedelta(seconds=11)).upstream_429_total == 1
+    state = store.get_rate_state()
+    assert state.consecutive_429_total == 0

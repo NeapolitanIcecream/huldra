@@ -80,12 +80,14 @@ class HuldraRateLimiter:
         status: int = 200,
         now: datetime | None = None,
     ) -> None:
+        previous = self.store.get_rate_state(self.name)
         self.store.set_rate_state(
             RateState(
                 name=self.name,
                 last_request_at=ensure_utc(now or utc_now()),
                 cooldown_until=None,
                 consecutive_429_total=0,
+                upstream_429_total=previous.upstream_429_total,
                 last_status=status,
                 last_error_message=None,
             )
@@ -109,6 +111,7 @@ class HuldraRateLimiter:
                 last_request_at=current,
                 cooldown_until=cooldown_until,
                 consecutive_429_total=previous.consecutive_429_total + 1,
+                upstream_429_total=previous.upstream_429_total + 1,
                 last_status=429,
                 last_error_message="arXiv returned HTTP 429",
             )
@@ -131,6 +134,7 @@ class HuldraRateLimiter:
                 last_request_at=ensure_utc(now or utc_now()),
                 cooldown_until=previous.cooldown_until,
                 consecutive_429_total=previous.consecutive_429_total,
+                upstream_429_total=previous.upstream_429_total,
                 last_status=status,
                 last_error_message=error_message,
             )

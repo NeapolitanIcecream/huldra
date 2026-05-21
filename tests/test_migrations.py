@@ -27,5 +27,9 @@ def test_migrations_are_idempotent_and_create_required_tables(tmp_path: Path) ->
             "worker_state",
             "events",
         } <= tables
+        rate_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(rate_state)").fetchall()
+        }
+        assert "upstream_429_total" in rate_columns
         journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert journal_mode == "wal"

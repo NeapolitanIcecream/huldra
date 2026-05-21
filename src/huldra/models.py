@@ -118,6 +118,7 @@ class RateState(HuldraModel):
     last_request_at: datetime | None = None
     cooldown_until: datetime | None = None
     consecutive_429_total: int = 0
+    upstream_429_total: int = 0
     last_status: int | None = None
     last_error_message: str | None = None
 

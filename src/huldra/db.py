@@ -301,6 +301,7 @@ class HuldraStore:
             last_request_at=from_isoformat_or_none(row["last_request_at"]),
             cooldown_until=from_isoformat_or_none(row["cooldown_until"]),
             consecutive_429_total=int(row["consecutive_429_total"]),
+            upstream_429_total=int(row["upstream_429_total"]),
             last_status=row["last_status"],
             last_error_message=row["last_error_message"],
         )
@@ -311,13 +312,14 @@ class HuldraStore:
                 """
                 INSERT INTO rate_state(
                     name, last_request_at, cooldown_until, consecutive_429_total,
-                    last_status, last_error_message
+                    upstream_429_total, last_status, last_error_message
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     last_request_at=excluded.last_request_at,
                     cooldown_until=excluded.cooldown_until,
                     consecutive_429_total=excluded.consecutive_429_total,
+                    upstream_429_total=excluded.upstream_429_total,
                     last_status=excluded.last_status,
                     last_error_message=excluded.last_error_message
                 """,
@@ -326,6 +328,7 @@ class HuldraStore:
                     isoformat_or_none(state.last_request_at),
                     isoformat_or_none(state.cooldown_until),
                     state.consecutive_429_total,
+                    state.upstream_429_total,
                     state.last_status,
                     state.last_error_message,
                 ),
@@ -605,7 +608,7 @@ class HuldraStore:
                 "SELECT COALESCE(SUM(upstream_requests_total), 0) AS total FROM cache_entries"
             ).fetchone()
             errors_429 = conn.execute(
-                "SELECT COALESCE(SUM(consecutive_429_total), 0) AS total FROM rate_state"
+                "SELECT COALESCE(SUM(upstream_429_total), 0) AS total FROM rate_state"
             ).fetchone()
             rate = conn.execute(
                 "SELECT cooldown_until FROM rate_state WHERE name = 'arxiv_legacy_api'"
