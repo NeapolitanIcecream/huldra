@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import ceil
 
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
@@ -59,17 +60,22 @@ class HuldraRateLimiter:
                 blocked_reason="cooldown",
                 cooldown_until=state.cooldown_until,
             )
+        wait_seconds = self.seconds_until_next_request(now=current)
+        lease_timeout_seconds = max(
+            self.settings.lease_timeout_seconds,
+            ceil(wait_seconds + self.settings.request_timeout_seconds + 5.0),
+        )
         acquired = self.store.acquire_lease(
             self.lease_name,
             owner_token,
-            self.settings.lease_timeout_seconds,
+            lease_timeout_seconds,
             now=current,
         )
         if not acquired:
             return RateLimitDecision(can_fetch=False, blocked_reason="lease_held")
         return RateLimitDecision(
             can_fetch=True,
-            wait_seconds=self.seconds_until_next_request(now=current),
+            wait_seconds=wait_seconds,
             lease_acquired=True,
         )
 

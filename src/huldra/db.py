@@ -4,12 +4,13 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from huldra.keys import request_cache_key
+from huldra.keys import normalize_arxiv_id, request_cache_key
 from huldra.migrations import apply_migrations
 from huldra.models import (
     ArxivPaper,
@@ -17,6 +18,7 @@ from huldra.models import (
     BrokerStatus,
     CacheEntry,
     QueueItem,
+    QueueWorkKind,
     RateState,
     RequestStatus,
 )
@@ -116,6 +118,7 @@ class HuldraStore:
         papers: list[ArxivPaper],
         total_results: int | None = None,
         upstream_status: int = 200,
+        upstream_request_count: int = 1,
         requested_at: datetime | None = None,
         completed_at: datetime | None = None,
     ) -> None:
@@ -128,7 +131,11 @@ class HuldraStore:
                 "SELECT upstream_requests_total FROM cache_entries WHERE cache_key = ?",
                 (cache_key,),
             ).fetchone()
-            upstream_total = int(previous["upstream_requests_total"]) + 1 if previous else 1
+            upstream_total = (
+                int(previous["upstream_requests_total"]) + upstream_request_count
+                if previous
+                else upstream_request_count
+            )
             conn.execute(
                 """
                 INSERT INTO cache_entries (
@@ -188,6 +195,52 @@ class HuldraStore:
             row = conn.execute("SELECT * FROM cache_entries WHERE cache_key = ?", (cache_key,)).fetchone()
         return _cache_entry_from_row(row) if row else None
 
+    def get_readable_completed_cache(self, cache_key: str) -> CacheEntry | None:
+        entry = self.get_cache_entry(cache_key)
+        if entry is None or entry.status != "completed":
+            return None
+        reason = self._completed_cache_integrity_failure(cache_key, entry)
+        if reason is None:
+            return entry
+        self.record_event(
+            "cache_integrity_failure",
+            {
+                "cache_key": cache_key,
+                "reason": reason,
+                "result_count": entry.result_count,
+            },
+        )
+        return None
+
+    def _completed_cache_integrity_failure(self, cache_key: str, entry: CacheEntry) -> str | None:
+        with self.connect() as conn:
+            match_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM cache_matches WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            joined_count = conn.execute(
+                """
+                SELECT COUNT(*) AS total FROM cache_matches m
+                JOIN papers p ON p.arxiv_id = m.arxiv_id
+                WHERE m.cache_key = ?
+                """,
+                (cache_key,),
+            ).fetchone()
+            positions = [
+                int(row["sort_position"])
+                for row in conn.execute(
+                    "SELECT sort_position FROM cache_matches WHERE cache_key = ? ORDER BY sort_position ASC",
+                    (cache_key,),
+                ).fetchall()
+            ]
+        if int(match_count["total"]) != entry.result_count:
+            return "match_count_mismatch"
+        if int(joined_count["total"]) != entry.result_count:
+            return "paper_join_mismatch"
+        if positions != list(range(entry.result_count)):
+            return "sort_position_gap"
+        return None
+
     def get_cached_papers(self, cache_key: str) -> list[ArxivPaper]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -200,6 +253,17 @@ class HuldraStore:
                 (cache_key,),
             ).fetchall()
         return [_paper_from_row(row) for row in rows]
+
+    def get_papers_by_ids(self, arxiv_ids: list[str] | tuple[str, ...]) -> dict[str, ArxivPaper]:
+        if not arxiv_ids:
+            return {}
+        placeholders = ",".join("?" for _ in arxiv_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM papers WHERE arxiv_id IN ({placeholders})",
+                tuple(arxiv_ids),
+            ).fetchall()
+        return {row["arxiv_id"]: _paper_from_row(row) for row in rows}
 
     def get_paper(self, arxiv_id: str) -> ArxivPaper | None:
         with self.connect() as conn:
@@ -335,7 +399,22 @@ class HuldraStore:
             )
 
     def enqueue_request(self, request: ArxivRequest, cache_key: str | None = None) -> QueueItem:
+        item, _joined = self.enqueue_request_for_work(request, cache_key)
+        return item
+
+    def enqueue_request_for_work(
+        self,
+        request: ArxivRequest,
+        cache_key: str | None = None,
+        *,
+        work_kind: QueueWorkKind | None = None,
+    ) -> tuple[QueueItem, bool]:
         key = cache_key or request_cache_key(request)
+        resolved_work_kind = work_kind or (
+            QueueWorkKind.REFRESH_COMPLETED
+            if request.cache_policy == "stale_while_revalidate"
+            else QueueWorkKind.FETCH_MISSING
+        )
         now = utc_now()
         now_s = isoformat_or_none(now)
         assert now_s is not None
@@ -350,15 +429,37 @@ class HuldraStore:
                 (key,),
             ).fetchone()
             if existing is not None:
-                return _queue_item_from_row(existing)
+                if (
+                    resolved_work_kind == QueueWorkKind.REFRESH_COMPLETED
+                    and existing["work_kind"] != QueueWorkKind.REFRESH_COMPLETED
+                ):
+                    conn.execute(
+                        """
+                        UPDATE queue_items
+                        SET work_kind=?, request_json=?, updated_at=?
+                        WHERE request_id=?
+                        """,
+                        (
+                            QueueWorkKind.REFRESH_COMPLETED,
+                            _request_json(request),
+                            now_s,
+                            existing["request_id"],
+                        ),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM queue_items WHERE request_id = ?",
+                        (existing["request_id"],),
+                    ).fetchone()
+                assert existing is not None
+                return _queue_item_from_row(existing), True
             request_id = str(uuid4())
             conn.execute(
                 """
                 INSERT INTO queue_items(
-                    request_id, cache_key, client_id, request_json, priority, status,
+                    request_id, cache_key, client_id, request_json, priority, status, work_kind,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -366,6 +467,7 @@ class HuldraStore:
                     request.client_id,
                     _request_json(request),
                     request.priority,
+                    resolved_work_kind,
                     now_s,
                     now_s,
                 ),
@@ -381,35 +483,55 @@ class HuldraStore:
             )
             row = conn.execute("SELECT * FROM queue_items WHERE request_id = ?", (request_id,)).fetchone()
         assert row is not None
-        return _queue_item_from_row(row)
+        return _queue_item_from_row(row), False
 
     def claim_next_queue_item(
         self,
         *,
         owner_token: str,
         claim_timeout_seconds: int = 300,
+        cache_keys: set[str] | frozenset[str] | None = None,
+        request_ids: set[str] | frozenset[str] | None = None,
         now: datetime | None = None,
     ) -> QueueItem | None:
+        if cache_keys is not None and not cache_keys:
+            return None
+        if request_ids is not None and not request_ids:
+            return None
         current = ensure_utc(now or utc_now())
         current_s = isoformat_or_none(current)
         claim_until = isoformat_or_none(current + timedelta(seconds=claim_timeout_seconds))
         assert current_s is not None and claim_until is not None
         with self.begin_immediate() as conn:
+            filters: list[str] = []
+            params: list[object] = []
+            if cache_keys is not None:
+                ordered = sorted(cache_keys)
+                filters.append(f"cache_key IN ({','.join('?' for _ in ordered)})")
+                params.extend(ordered)
+            if request_ids is not None:
+                ordered_ids = sorted(request_ids)
+                filters.append(f"request_id IN ({','.join('?' for _ in ordered_ids)})")
+                params.extend(ordered_ids)
+            target_filter = f"AND {' AND '.join(filters)}" if filters else ""
             row = conn.execute(
-                """
+                f"""
                 SELECT * FROM queue_items
                 WHERE (
-                    status IN ('queued', 'delayed')
-                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ) OR (
-                    status = 'claimed'
-                    AND claimed_until IS NOT NULL
-                    AND claimed_until <= ?
+                    (
+                        status IN ('queued', 'delayed')
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                    ) OR (
+                        status = 'claimed'
+                        AND claimed_until IS NOT NULL
+                        AND claimed_until <= ?
+                    )
                 )
+                {target_filter}
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 """,
-                (current_s, current_s),
+                (current_s, current_s, *params),
             ).fetchone()
             if row is None:
                 return None
@@ -430,6 +552,118 @@ class HuldraStore:
             ).fetchone()
         assert updated is not None
         return _queue_item_from_row(updated)
+
+    def acquire_id_fetch_reservations(
+        self,
+        arxiv_ids: list[str] | tuple[str, ...],
+        *,
+        owner_token: str,
+        request_id: str,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> IdReservationResult:
+        if not arxiv_ids:
+            return IdReservationResult(acquired_ids=(), blocked_until=None)
+        current = ensure_utc(now or utc_now())
+        current_s = isoformat_or_none(current)
+        expires_at = current + timedelta(seconds=ttl_seconds)
+        expires_s = isoformat_or_none(expires_at)
+        assert current_s is not None and expires_s is not None
+        ids = tuple(dict.fromkeys(arxiv_ids))
+        with self.begin_immediate() as conn:
+            conn.execute(
+                "DELETE FROM id_fetch_reservations WHERE expires_at <= ?",
+                (current_s,),
+            )
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT * FROM id_fetch_reservations WHERE arxiv_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            blocked_until_values = [
+                from_isoformat_or_none(row["expires_at"])
+                for row in rows
+                if row["owner_token"] != owner_token
+            ]
+            blocked_until_values = [value for value in blocked_until_values if value is not None]
+            if blocked_until_values:
+                return IdReservationResult(
+                    acquired_ids=(),
+                    blocked_until=min(blocked_until_values),
+                )
+            for arxiv_id in ids:
+                conn.execute(
+                    """
+                    INSERT INTO id_fetch_reservations(
+                        arxiv_id, owner_token, request_id, acquired_at, expires_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(arxiv_id) DO UPDATE SET
+                        owner_token=excluded.owner_token,
+                        request_id=excluded.request_id,
+                        acquired_at=excluded.acquired_at,
+                        expires_at=excluded.expires_at
+                    """,
+                    (arxiv_id, owner_token, request_id, current_s, expires_s),
+                )
+        return IdReservationResult(acquired_ids=ids, blocked_until=None)
+
+    def release_id_fetch_reservations(
+        self,
+        arxiv_ids: list[str] | tuple[str, ...],
+        *,
+        owner_token: str,
+    ) -> None:
+        if not arxiv_ids:
+            return
+        ids = tuple(dict.fromkeys(arxiv_ids))
+        placeholders = ",".join("?" for _ in ids)
+        timestamp = isoformat_or_none(utc_now())
+        assert timestamp is not None
+        with self.begin_immediate() as conn:
+            deleted = conn.execute(
+                f"DELETE FROM id_fetch_reservations WHERE owner_token = ? AND arxiv_id IN ({placeholders})",
+                (owner_token, *ids),
+            )
+            if deleted.rowcount:
+                self._wake_id_fetch_reserved_queue_items_conn(conn, ids, timestamp)
+
+    def _wake_id_fetch_reserved_queue_items_conn(
+        self,
+        conn: sqlite3.Connection,
+        released_ids: tuple[str, ...],
+        timestamp: str,
+    ) -> None:
+        released = set(released_ids)
+        rows = conn.execute(
+            """
+            SELECT request_id, request_json
+            FROM queue_items
+            WHERE status = 'delayed' AND error_category = 'id_fetch_reserved'
+            """
+        ).fetchall()
+        request_ids = []
+        for row in rows:
+            request = _request_from_json(row["request_json"])
+            if any(normalize_arxiv_id(value) in released for value in request.id_list):
+                request_ids.append(row["request_id"])
+        if not request_ids:
+            return
+        placeholders = ",".join("?" for _ in request_ids)
+        conn.execute(
+            f"""
+            UPDATE queue_items
+            SET status='queued',
+                next_attempt_at=NULL,
+                updated_at=?,
+                claimed_by=NULL,
+                claimed_until=NULL,
+                error_category=NULL,
+                error_message=NULL
+            WHERE request_id IN ({placeholders})
+            """,
+            (timestamp, *request_ids),
+        )
 
     def get_queue_item(self, request_id: str) -> QueueItem | None:
         with self.connect() as conn:
@@ -701,6 +935,10 @@ class HuldraStore:
             for row in rows
         ]
 
+    def record_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        with self.begin_immediate() as conn:
+            self._record_event_conn(conn, event_type, payload)
+
     def _record_event_conn(
         self,
         conn: sqlite3.Connection,
@@ -725,6 +963,12 @@ def _request_json(request: ArxivRequest) -> str:
 
 def _request_from_json(value: str) -> ArxivRequest:
     return ArxivRequest.model_validate_json(value)
+
+
+@dataclass(frozen=True, slots=True)
+class IdReservationResult:
+    acquired_ids: tuple[str, ...]
+    blocked_until: datetime | None
 
 
 def _cache_entry_from_row(row: sqlite3.Row) -> CacheEntry:
@@ -753,6 +997,7 @@ def _queue_item_from_row(row: sqlite3.Row) -> QueueItem:
         request=_request_from_json(row["request_json"]),
         priority=int(row["priority"]),
         status=row["status"],
+        work_kind=row["work_kind"],
         created_at=from_isoformat_or_none(row["created_at"]) or utc_now(),
         updated_at=from_isoformat_or_none(row["updated_at"]) or utc_now(),
         claimed_by=row["claimed_by"],

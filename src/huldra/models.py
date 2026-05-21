@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -29,6 +29,11 @@ class RequestStatus(StrEnum):
     FAILED = "failed"
 
 
+class QueueWorkKind(StrEnum):
+    FETCH_MISSING = "fetch_missing"
+    REFRESH_COMPLETED = "refresh_completed"
+
+
 SortBy = Literal["relevance", "lastUpdatedDate", "submittedDate"]
 SortOrder = Literal["ascending", "descending"]
 ApiFamily = Literal["legacy_search"]
@@ -36,6 +41,10 @@ ApiFamily = Literal["legacy_search"]
 
 class HuldraModel(BaseModel):
     model_config = ConfigDict(use_enum_values=True, extra="forbid")
+
+
+class HuldraResponseModel(BaseModel):
+    model_config = ConfigDict(use_enum_values=True, extra="allow")
 
 
 class ArxivRequest(HuldraModel):
@@ -50,6 +59,7 @@ class ArxivRequest(HuldraModel):
     submitted_end: datetime | None = None
     cache_policy: CachePolicy = CachePolicy.CACHE_OR_ENQUEUE
     readiness: ReadinessMode = ReadinessMode.RAW_COMPLETED
+    maturity_lag_days: int | None = None
     priority: int = 0
     timeout_seconds: float | None = Field(default=None, gt=0)
     api_family: ApiFamily = "legacy_search"
@@ -67,7 +77,10 @@ class ArxivRequest(HuldraModel):
     def _datetime_to_utc(cls, value: datetime | None) -> datetime | None:
         if value is None:
             return None
-        return ensure_utc(value)
+        normalized = ensure_utc(value)
+        if normalized.second != 0 or normalized.microsecond != 0:
+            raise ValueError("submitted-date bounds must use UTC minute precision")
+        return normalized
 
     @model_validator(mode="after")
     def _validate_request_shape(self) -> ArxivRequest:
@@ -86,10 +99,21 @@ class ArxivRequest(HuldraModel):
                 raise ValueError(
                     "do not combine submittedDate in search_query with submitted_start/submitted_end"
                 )
+        if (
+            ids
+            and not query
+            and self.submitted_start is None
+            and self.submitted_end is None
+            and self.start == 0
+            and self.sort_by == "submittedDate"
+            and self.sort_order == "descending"
+            and self.max_results < len(ids)
+        ):
+            raise ValueError("max_results must be at least the number of requested IDs")
         return self
 
 
-class ArxivPaper(HuldraModel):
+class ArxivPaper(HuldraResponseModel):
     arxiv_id: str
     version: int | None = None
     canonical_url: str
@@ -130,6 +154,7 @@ class QueueItem(HuldraModel):
     request: ArxivRequest
     priority: int
     status: RequestStatus
+    work_kind: QueueWorkKind = QueueWorkKind.FETCH_MISSING
     created_at: datetime
     updated_at: datetime
     claimed_by: str | None = None
@@ -157,7 +182,7 @@ class CacheEntry(HuldraModel):
     error_message: str | None = None
 
 
-class BrokerStatus(HuldraModel):
+class BrokerStatus(HuldraResponseModel):
     upstream_requests_total: int = 0
     upstream_429_total: int = 0
     cooldown_until: datetime | None = None
@@ -176,15 +201,19 @@ class BrokerStatus(HuldraModel):
     oldest_pending_request_at: datetime | None = None
 
 
-class ArxivResult(HuldraModel):
+class ArxivResult(HuldraResponseModel):
+    serving_mode: str = ReadinessMode.RAW_COMPLETED
     status: str
     cache_key: str
     request_id: str | None = None
     papers: list[ArxivPaper] = Field(default_factory=list)
     papers_total: int = 0
+    cached_papers_total: int = 0
     total_results: int | None = None
     cache_hit: bool = False
     stale: bool = False
+    cache_readable: bool = False
+    mature: bool = True
     ready: bool = False
     analysis_ready: bool = False
     maturity_applicable: bool = False
@@ -196,6 +225,97 @@ class ArxivResult(HuldraModel):
     completed_at: datetime | None = None
     queued_at: datetime | None = None
     upstream_status: int | None = None
+
+
+class ArxivRawInspectionResult(HuldraResponseModel):
+    serving_mode: Literal["raw_inspection"] = "raw_inspection"
+    status: str
+    cache_key: str
+    papers: list[ArxivPaper] = Field(default_factory=list)
+    papers_total: int = 0
+    total_results: int | None = None
+    cache_hit: bool = False
+    cache_readable: bool = False
+    cooldown_until: datetime | None = None
+    blocked_reason: str | None = None
+    error_category: str | None = None
+    error_message: str | None = None
+    completed_at: datetime | None = None
+    upstream_status: int | None = None
+
+
+class HuldraMaintenanceRequestResult(HuldraResponseModel):
+    cache_key: str
+    request_id: str | None = None
+    search_query: str | None = None
+    submitted_start: datetime | None = None
+    submitted_end: datetime | None = None
+    raw_cache_status: str
+    serving_status: str | None = None
+    cache_hit: bool = False
+    joined_existing_queue: bool = False
+    upstream_status: int | None = None
+    cooldown_until: datetime | None = None
+    error_category: str | None = None
+    error_message: str | None = None
+    papers_total: int = 0
+
+
+class HuldraMaintenanceResult(HuldraResponseModel):
+    requested_total: int = 0
+    queued_total: int = 0
+    cache_miss_total: int = 0
+    cache_hit_total: int = 0
+    completed_windows_total: int = 0
+    upstream_requests_total: int = 0
+    upstream_429_total: int = 0
+    retry_after_seconds: int | None = None
+    cooldown_active_total: int = 0
+    skipped_windows_total: int = 0
+    rate_limited_windows_total: int = 0
+    failed_windows_total: int = 0
+    papers_total: int = 0
+    cooldown_active: bool = False
+    cooldown_until: datetime | None = None
+    requests: list[HuldraMaintenanceRequestResult] = Field(default_factory=list)
+
+
+class HuldraSyncRequest(HuldraModel):
+    requests: list[ArxivRequest]
+    wait: bool = False
+    wait_timeout_seconds: float | None = Field(default=None, gt=0)
+
+
+class HuldraBackfillRequest(HuldraModel):
+    search_queries: list[str]
+    start_date: date
+    end_date: date
+    max_results: int = Field(default=50, ge=1, le=2000)
+    wait: bool = False
+    wait_timeout_seconds: float | None = Field(default=None, gt=0)
+    client_id: str = "huldra-backfill"
+
+    @field_validator("search_queries")
+    @classmethod
+    def _search_queries_not_blank(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value if item.strip()]
+        if not normalized:
+            raise ValueError("search_queries cannot be empty")
+        return normalized
+
+    @field_validator("client_id")
+    @classmethod
+    def _backfill_client_id_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("client_id cannot be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_backfill_dates(self) -> HuldraBackfillRequest:
+        if self.start_date > self.end_date:
+            raise ValueError("start_date must be on or before end_date")
+        return self
 
 
 def utc_day_floor(value: datetime) -> datetime:

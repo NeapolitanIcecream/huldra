@@ -24,6 +24,41 @@ uv run huldra status --db ~/.local/share/huldra/huldra.db --json
 The status payload shows `cooldown_until` and `cooldown_active` so supervisors
 can tell when arXiv returned HTTP 429 and the worker is waiting.
 
+## Sync And Backfill Jobs
+
+Use `sync` for an explicit submitted-date day. `--wait` drains that request set
+through the same queue, limiter, and fetcher used by the worker.
+
+```bash
+uv run huldra sync \
+  --db ~/.local/share/huldra/huldra.db \
+  --search-query 'cat:cs.AI' \
+  --date 2026-05-20 \
+  --max-results 60 \
+  --wait \
+  --json
+```
+
+Use `backfill` to enqueue daily submitted-date windows for a date range:
+
+```bash
+uv run huldra backfill \
+  --db ~/.local/share/huldra/huldra.db \
+  --search-query 'cat:cs.AI' \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-20 \
+  --max-results 60 \
+  --json
+```
+
+The JSON summary reports only work attributed to that command. For example,
+`upstream_requests_total` increments only when the command's inline wait path
+executes the fetch. If another worker completes a joined queue item, the window
+can still count as completed without adding an upstream request to that command.
+
+You can run `sync --wait` without a separate worker for short pre-syncs. Keep a
+supervised worker running for normal background draining and stale refresh work.
+
 ## systemd User Service
 
 ```ini

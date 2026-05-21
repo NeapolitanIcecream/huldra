@@ -40,11 +40,87 @@ curl -X POST 'http://127.0.0.1:8765/v1/requests?wait=true' \
   }'
 ```
 
+## Cache-Only Analysis Read
+
+Use `analysis_ready` when the caller must not consume immature submitted-date
+windows.
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/requests \
+  -H 'content-type: application/json' \
+  -d '{
+    "client_id": "recoleta:example",
+    "search_query": "cat:cs.AI",
+    "submitted_start": "2026-05-20T00:00:00+00:00",
+    "submitted_end": "2026-05-21T00:00:00+00:00",
+    "max_results": 60,
+    "cache_policy": "cache_only",
+    "readiness": "analysis_ready"
+  }'
+```
+
+If the cache is complete but the window is not mature, the response has
+`status="immature"`, `analysis_ready=false`, and an empty `papers` list.
+`cached_papers_total` reports how many cached papers were suppressed.
+
+Use `readiness="raw_completed"` to inspect the same completed cache without
+blocking on maturity. Raw reads can return papers, but they still report the
+maturity facts.
+
 ## Read A Result
 
 ```bash
 curl http://127.0.0.1:8765/v1/results/huldra:v1:REPLACE_ME
 ```
+
+This endpoint is for raw cache inspection. It returns
+`serving_mode="raw_inspection"` and does not apply caller-specific readiness
+settings.
+
+## Sync Explicit Windows
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/sync \
+  -H 'content-type: application/json' \
+  -d '{
+    "wait": true,
+    "wait_timeout_seconds": 30,
+    "requests": [
+      {
+        "client_id": "recoleta:example",
+        "search_query": "cat:cs.AI",
+        "submitted_start": "2026-05-20T00:00:00+00:00",
+        "submitted_end": "2026-05-21T00:00:00+00:00",
+        "max_results": 60,
+        "cache_policy": "cache_only",
+        "readiness": "analysis_ready"
+      }
+    ]
+  }'
+```
+
+`wait=true` drains only the requested cache keys inline. Other queued work may
+remain queued.
+
+## Backfill Daily Windows
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/backfill \
+  -H 'content-type: application/json' \
+  -d '{
+    "search_queries": ["cat:cs.AI", "cat:cs.LG"],
+    "start_date": "2026-05-01",
+    "end_date": "2026-05-07",
+    "max_results": 60,
+    "wait": false,
+    "client_id": "huldra-backfill"
+  }'
+```
+
+The maintenance response reports counters for this call, including
+`requested_total`, `queued_total`, `cache_hit_total`, `cache_miss_total`,
+`completed_windows_total`, `upstream_requests_total`, `upstream_429_total`, and
+per-window `raw_cache_status` and `serving_status`.
 
 ## Read A Paper
 

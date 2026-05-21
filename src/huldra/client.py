@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+from datetime import date
 from types import TracebackType
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from huldra.models import ArxivPaper, ArxivRequest, ArxivResult, BrokerStatus
+from huldra.models import (
+    ArxivPaper,
+    ArxivRawInspectionResult,
+    ArxivRequest,
+    ArxivResult,
+    BrokerStatus,
+    HuldraMaintenanceResult,
+)
 
 
 class HuldraClientError(RuntimeError):
@@ -89,8 +97,52 @@ class HuldraClient:
             wait=wait,
         )
 
-    def get_result(self, cache_key: str) -> ArxivResult:
-        return ArxivResult.model_validate(self._json(self._client.get(f"/v1/results/{cache_key}")))
+    def get_result(self, cache_key: str) -> ArxivRawInspectionResult:
+        return ArxivRawInspectionResult.model_validate(
+            self._json(self._client.get(f"/v1/results/{cache_key}"))
+        )
+
+    def sync_windows(
+        self,
+        requests: list[ArxivRequest],
+        *,
+        wait: bool = False,
+        wait_timeout_seconds: float | None = None,
+    ) -> HuldraMaintenanceResult:
+        response = self._client.post(
+            "/v1/sync",
+            json={
+                "requests": [request.model_dump(mode="json") for request in requests],
+                "wait": wait,
+                "wait_timeout_seconds": wait_timeout_seconds,
+            },
+        )
+        return HuldraMaintenanceResult.model_validate(self._json(response))
+
+    def backfill_windows(
+        self,
+        *,
+        search_queries: list[str],
+        start_date: date | str,
+        end_date: date | str,
+        max_results: int,
+        wait: bool = False,
+        wait_timeout_seconds: float | None = None,
+        client_id: str = "huldra-backfill",
+    ) -> HuldraMaintenanceResult:
+        response = self._client.post(
+            "/v1/backfill",
+            json={
+                "search_queries": search_queries,
+                "start_date": start_date.isoformat() if isinstance(start_date, date) else start_date,
+                "end_date": end_date.isoformat() if isinstance(end_date, date) else end_date,
+                "max_results": max_results,
+                "wait": wait,
+                "wait_timeout_seconds": wait_timeout_seconds,
+                "client_id": client_id,
+            },
+        )
+        return HuldraMaintenanceResult.model_validate(self._json(response))
 
     def get_paper(self, arxiv_id: str) -> ArxivPaper | None:
         encoded = quote(arxiv_id, safe="")

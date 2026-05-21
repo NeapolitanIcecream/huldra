@@ -7,7 +7,7 @@ from datetime import timedelta
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import FetchResult
+from huldra.fetcher import FetchResult, NonRetryableFetchError
 from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, CachePolicy, RateState
 from huldra.time import utc_now
@@ -18,6 +18,11 @@ from tests.conftest import make_paper
 class _StaticFetcher:
     def fetch(self, request: ArxivRequest) -> FetchResult:
         return FetchResult([make_paper("2401.00002v1")], total_results=1)
+
+
+class _NonRetryableFetcher:
+    def fetch(self, request: ArxivRequest) -> FetchResult:
+        raise NonRetryableFetchError("arXiv API returned HTTP 404", status_code=404)
 
 
 def test_broker_returns_completed_cache_hit(
@@ -128,6 +133,55 @@ def test_wait_until_ready_waits_for_queued_retry_after_transient_cache_failure(
     assert result.status == "ready"
     assert result.cache_hit
     assert result.papers_total == 1
+
+
+def test_wait_until_ready_reports_failed_retry_for_unreadable_completed_cache(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: terminal retries for corrupt completed caches must not time out."""
+    request = ArxivRequest(
+        client_id="demo",
+        search_query="cat:cs.AI",
+        cache_policy=CachePolicy.WAIT_UNTIL_READY,
+        timeout_seconds=0.5,
+    )
+    key = request_cache_key(request)
+    store.record_completed_cache_entry(cache_key=key, request=request, papers=[make_paper()])
+    with store.begin_immediate() as conn:
+        conn.execute("DELETE FROM cache_matches WHERE cache_key = ?", (key,))
+    worker_errors: list[BaseException] = []
+
+    def fail_retry() -> None:
+        try:
+            deadline = time.monotonic() + 1.0
+            while store.status_summary().queue_depth_total == 0:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("retry request was not enqueued")
+                time.sleep(0.005)
+            result = HuldraWorker(
+                store,
+                settings,
+                fetcher=_NonRetryableFetcher(),
+                sleep=lambda _: None,
+            ).run_once()
+            assert result.status == "failed"
+        except BaseException as exc:  # pragma: no cover - re-raised in test thread
+            worker_errors.append(exc)
+
+    retry_thread = threading.Thread(target=fail_retry)
+    retry_thread.start()
+
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    retry_thread.join(timeout=1.0)
+    assert not retry_thread.is_alive()
+    assert not worker_errors, worker_errors
+    assert result.status == "failed"
+    assert result.cache_key == key
+    assert result.cache_hit
+    assert not result.cache_readable
+    assert result.error_category == "non_retryable"
 
 
 def test_cooldown_state_is_exposed_while_request_is_enqueued(

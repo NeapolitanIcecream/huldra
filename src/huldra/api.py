@@ -10,10 +10,14 @@ from huldra.db import HuldraStore
 from huldra.keys import normalize_arxiv_id
 from huldra.models import (
     ArxivPaper,
+    ArxivRawInspectionResult,
     ArxivRequest,
     ArxivResult,
     BrokerStatus,
     CachePolicy,
+    HuldraBackfillRequest,
+    HuldraMaintenanceResult,
+    HuldraSyncRequest,
 )
 
 
@@ -47,9 +51,29 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="request not found")
         return item.model_dump(mode="json")
 
-    @app.get("/v1/results/{cache_key}", response_model=ArxivResult)
-    def get_result(cache_key: str) -> ArxivResult:
+    @app.get("/v1/results/{cache_key}", response_model=ArxivRawInspectionResult)
+    def get_result(cache_key: str) -> ArxivRawInspectionResult:
         return broker.get_result(cache_key)
+
+    @app.post("/v1/sync", response_model=HuldraMaintenanceResult)
+    def sync_windows(request: HuldraSyncRequest) -> HuldraMaintenanceResult:
+        return broker.sync_windows(
+            request.requests,
+            wait=request.wait,
+            wait_timeout_seconds=request.wait_timeout_seconds,
+        )
+
+    @app.post("/v1/backfill", response_model=HuldraMaintenanceResult)
+    def backfill_windows(request: HuldraBackfillRequest) -> HuldraMaintenanceResult:
+        return broker.backfill_windows(
+            search_queries=request.search_queries,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            max_results=request.max_results,
+            wait=request.wait,
+            wait_timeout_seconds=request.wait_timeout_seconds,
+            client_id=request.client_id,
+        )
 
     @app.get("/v1/papers/{arxiv_id:path}", response_model=ArxivPaper | None)
     def get_paper(arxiv_id: str) -> ArxivPaper | None:

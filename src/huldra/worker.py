@@ -19,8 +19,9 @@ from huldra.fetcher import (
     RateLimitedError,
     TransientFetchError,
 )
+from huldra.keys import arxiv_version, normalize_arxiv_id
 from huldra.limiter import HuldraRateLimiter
-from huldra.models import ArxivRequest, RequestStatus
+from huldra.models import ArxivPaper, ArxivRequest, CachePolicy, QueueItem, QueueWorkKind, RequestStatus
 from huldra.time import utc_now
 
 log = logger.bind(module="huldra.worker")
@@ -37,6 +38,7 @@ class WorkerPassResult:
     cache_key: str | None = None
     papers_total: int = 0
     cooldown_until: datetime | None = None
+    retry_after_seconds: int | None = None
     error_category: str | None = None
     error_message: str | None = None
 
@@ -47,9 +49,19 @@ class WorkerPassResult:
             "cache_key": self.cache_key,
             "papers_total": self.papers_total,
             "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "retry_after_seconds": self.retry_after_seconds,
             "error_category": self.error_category,
             "error_message": self.error_message,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _IdListFetchPlan:
+    requested_ids: tuple[str, ...]
+    fetch_request: ArxivRequest | None = None
+    reserved_ids: tuple[str, ...] = ()
+    papers_by_id: dict[str, ArxivPaper] | None = None
+    blocked_until: datetime | None = None
 
 
 class HuldraWorker:
@@ -72,20 +84,25 @@ class HuldraWorker:
         self.sleep = sleep or time.sleep
         self.name = name
 
-    def run_once(self) -> WorkerPassResult:
+    def run_once(
+        self,
+        *,
+        target_cache_keys: frozenset[str] | set[str] | None = None,
+    ) -> WorkerPassResult:
         self.store.init_schema()
         self.store.record_worker_started(name=self.name)
         item = self.store.claim_next_queue_item(
             owner_token=self.owner_token,
             claim_timeout_seconds=self.settings.queue_claim_timeout_seconds,
+            cache_keys=target_cache_keys,
         )
         if item is None:
             next_wake = utc_now() + timedelta(seconds=self.settings.worker_poll_interval_seconds)
             self.store.record_worker_completed(name=self.name, next_wake_at=next_wake)
             return WorkerPassResult(status="idle")
 
-        cached = self.store.get_cache_entry(item.cache_key)
-        if cached is not None and cached.status == "completed":
+        cached = self.store.get_readable_completed_cache(item.cache_key)
+        if cached is not None and item.work_kind == QueueWorkKind.FETCH_MISSING:
             self.store.complete_queue_item(item.request_id)
             self.store.record_worker_completed(name=self.name)
             return WorkerPassResult(
@@ -94,6 +111,47 @@ class HuldraWorker:
                 cache_key=item.cache_key,
                 papers_total=cached.result_count,
             )
+
+        id_plan = self._plan_id_list_fetch(item)
+        if id_plan is not None:
+            if id_plan.fetch_request is None and id_plan.blocked_until is None:
+                assert id_plan.papers_by_id is not None
+                papers = [id_plan.papers_by_id[arxiv_id] for arxiv_id in id_plan.requested_ids]
+                self.store.record_completed_cache_entry(
+                    cache_key=item.cache_key,
+                    request=item.request,
+                    papers=papers,
+                    total_results=len(papers),
+                    upstream_request_count=0,
+                )
+                self.store.complete_queue_item(item.request_id)
+                self.store.record_worker_completed(name=self.name)
+                return WorkerPassResult(
+                    status="cache_hit",
+                    request_id=item.request_id,
+                    cache_key=item.cache_key,
+                    papers_total=len(papers),
+                )
+            if id_plan.blocked_until is not None:
+                self.store.release_or_delay_queue_item(
+                    item.request_id,
+                    next_attempt_at=id_plan.blocked_until,
+                    error_category="id_fetch_reserved",
+                    error_message="id fetch reserved by another worker",
+                )
+                self.store.record_worker_completed(
+                    name=self.name,
+                    next_wake_at=id_plan.blocked_until,
+                    error_category="id_fetch_reserved",
+                    error_message="id fetch reserved by another worker",
+                )
+                return WorkerPassResult(
+                    status="blocked",
+                    request_id=item.request_id,
+                    cache_key=item.cache_key,
+                    cooldown_until=id_plan.blocked_until,
+                    error_category="id_fetch_reserved",
+                )
 
         decision = self.limiter.before_request(owner_token=self.owner_token)
         if not decision.can_fetch:
@@ -106,6 +164,7 @@ class HuldraWorker:
                 error_category=decision.blocked_reason,
                 error_message=decision.blocked_reason,
             )
+            self._release_id_plan(id_plan)
             self.store.record_worker_completed(
                 name=self.name,
                 next_wake_at=next_attempt,
@@ -125,8 +184,13 @@ class HuldraWorker:
             assert callable(sleeper)
             sleeper(decision.wait_seconds)
 
+        fetch_request = (
+            id_plan.fetch_request
+            if id_plan is not None and id_plan.fetch_request is not None
+            else item.request
+        )
         try:
-            result = self.fetcher.fetch(item.request)
+            result = self.fetcher.fetch(fetch_request)
         except RateLimitedError as exc:
             cooldown_until = self.limiter.after_429(
                 owner_token=self.owner_token,
@@ -144,6 +208,7 @@ class HuldraWorker:
                 error_category="rate_limited",
                 error_message=str(exc),
             )
+            self._release_id_plan(id_plan)
             self.store.record_worker_completed(
                 name=self.name,
                 next_wake_at=cooldown_until,
@@ -158,6 +223,7 @@ class HuldraWorker:
                 request_id=item.request_id,
                 cache_key=item.cache_key,
                 cooldown_until=cooldown_until,
+                retry_after_seconds=exc.retry_after_seconds,
                 error_category="rate_limited",
                 error_message=str(exc),
             )
@@ -181,6 +247,7 @@ class HuldraWorker:
                 error_category="transient",
                 error_message=str(exc),
             )
+            self._release_id_plan(id_plan)
             self.store.record_worker_completed(
                 name=self.name,
                 next_wake_at=next_attempt,
@@ -215,6 +282,7 @@ class HuldraWorker:
                 error_category="non_retryable",
                 error_message=str(exc),
             )
+            self._release_id_plan(id_plan)
             self.store.record_worker_completed(
                 name=self.name,
                 error_category="non_retryable",
@@ -233,6 +301,7 @@ class HuldraWorker:
                 status=exc.status_code,
                 error_message=str(exc),
             )
+            self._release_id_plan(id_plan)
             self.store.record_worker_completed(
                 name=self.name,
                 error_category="fetch_error",
@@ -240,23 +309,160 @@ class HuldraWorker:
             )
             raise
 
+        papers = result.papers
+        total_results = result.total_results
+        if id_plan is not None:
+            papers_by_id = _id_list_paper_lookup(id_plan.papers_by_id or {}, result.papers)
+            missing_after_fetch = [
+                arxiv_id for arxiv_id in id_plan.requested_ids if arxiv_id not in papers_by_id
+            ]
+            if missing_after_fetch:
+                self.limiter.after_failure(
+                    owner_token=self.owner_token,
+                    status=result.upstream_status,
+                    error_message="upstream response omitted requested IDs",
+                )
+                self.store.record_cache_failure(
+                    cache_key=item.cache_key,
+                    request=item.request,
+                    error_category="non_retryable",
+                    error_message="upstream response omitted requested IDs",
+                    upstream_status=result.upstream_status,
+                )
+                self.store.release_or_delay_queue_item(
+                    item.request_id,
+                    status=RequestStatus.FAILED,
+                    error_category="non_retryable",
+                    error_message="upstream response omitted requested IDs",
+                )
+                self._release_id_plan(id_plan)
+                self.store.record_worker_completed(
+                    name=self.name,
+                    error_category="non_retryable",
+                    error_message="upstream response omitted requested IDs",
+                )
+                return WorkerPassResult(
+                    status="failed",
+                    request_id=item.request_id,
+                    cache_key=item.cache_key,
+                    error_category="non_retryable",
+                    error_message="upstream response omitted requested IDs",
+                )
+            papers = _ordered_id_list_papers(id_plan.requested_ids, papers_by_id)
+            total_results = len(papers)
+
         self.store.record_completed_cache_entry(
             cache_key=item.cache_key,
             request=item.request,
-            papers=result.papers,
-            total_results=result.total_results,
+            papers=papers,
+            total_results=total_results,
             upstream_status=result.upstream_status,
         )
         self.limiter.after_success(owner_token=self.owner_token, status=result.upstream_status)
         self.store.complete_queue_item(item.request_id)
+        self._release_id_plan(id_plan)
         self.store.record_worker_completed(name=self.name)
         return WorkerPassResult(
             status="completed",
             request_id=item.request_id,
             cache_key=item.cache_key,
-            papers_total=len(result.papers),
+            papers_total=len(papers),
         )
+
+    def _plan_id_list_fetch(self, item: QueueItem) -> _IdListFetchPlan | None:
+        if item.work_kind != QueueWorkKind.FETCH_MISSING or not _is_pure_id_list_request(item.request):
+            return None
+        requested_ids = tuple(dict.fromkeys(normalize_arxiv_id(value) for value in item.request.id_list))
+        papers_by_id = self.store.get_papers_by_ids(requested_ids)
+        missing = tuple(arxiv_id for arxiv_id in requested_ids if arxiv_id not in papers_by_id)
+        if not missing:
+            return _IdListFetchPlan(requested_ids=requested_ids, papers_by_id=papers_by_id)
+        reservations = self.store.acquire_id_fetch_reservations(
+            missing,
+            owner_token=self.owner_token,
+            request_id=item.request_id,
+            ttl_seconds=self.settings.queue_claim_timeout_seconds,
+        )
+        if reservations.blocked_until is not None:
+            return _IdListFetchPlan(
+                requested_ids=requested_ids,
+                papers_by_id=papers_by_id,
+                blocked_until=reservations.blocked_until,
+            )
+        return _IdListFetchPlan(
+            requested_ids=requested_ids,
+            fetch_request=item.request.model_copy(
+                update={
+                    "id_list": reservations.acquired_ids,
+                    "cache_policy": CachePolicy.CACHE_OR_ENQUEUE,
+                }
+            ),
+            reserved_ids=reservations.acquired_ids,
+            papers_by_id=papers_by_id,
+        )
+
+    def _release_id_plan(self, plan: _IdListFetchPlan | None) -> None:
+        if plan is not None and plan.reserved_ids:
+            self.store.release_id_fetch_reservations(
+                plan.reserved_ids,
+                owner_token=self.owner_token,
+            )
 
 
 def _backoff_seconds(attempts_total: int) -> int:
     return min(3600, max(5, 2 ** max(1, attempts_total)))
+
+
+def _is_pure_id_list_request(request: ArxivRequest) -> bool:
+    return (
+        bool(request.id_list)
+        and request.search_query is None
+        and request.submitted_start is None
+        and request.submitted_end is None
+        and request.start == 0
+        and request.sort_by == "submittedDate"
+        and request.sort_order == "descending"
+        and request.max_results >= len(request.id_list)
+    )
+
+
+def _id_list_paper_lookup(
+    cached_papers_by_id: dict[str, ArxivPaper],
+    fetched_papers: list[ArxivPaper],
+) -> dict[str, ArxivPaper]:
+    lookup = dict(cached_papers_by_id)
+    for paper in cached_papers_by_id.values():
+        _add_id_list_paper_lookup(lookup, paper)
+    for paper in fetched_papers:
+        _add_id_list_paper_lookup(lookup, paper)
+    return lookup
+
+
+def _add_id_list_paper_lookup(lookup: dict[str, ArxivPaper], paper: ArxivPaper) -> None:
+    arxiv_id = normalize_arxiv_id(paper.arxiv_id)
+    lookup[arxiv_id] = paper
+    versionless_id = _versionless_arxiv_id(arxiv_id)
+    if versionless_id != arxiv_id:
+        lookup.setdefault(versionless_id, paper)
+
+
+def _ordered_id_list_papers(
+    requested_ids: tuple[str, ...],
+    papers_by_id: dict[str, ArxivPaper],
+) -> list[ArxivPaper]:
+    papers: list[ArxivPaper] = []
+    seen: set[str] = set()
+    for arxiv_id in requested_ids:
+        paper = papers_by_id[arxiv_id]
+        if paper.arxiv_id in seen:
+            continue
+        seen.add(paper.arxiv_id)
+        papers.append(paper)
+    return papers
+
+
+def _versionless_arxiv_id(arxiv_id: str) -> str:
+    version = arxiv_version(arxiv_id)
+    if version is None:
+        return arxiv_id
+    return arxiv_id[: -len(f"v{version}")]

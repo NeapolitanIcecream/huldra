@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -14,6 +15,7 @@ from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import normalize_arxiv_id
 from huldra.models import ArxivRequest, CachePolicy
+from huldra.planner import build_submitted_date_windows
 from huldra.time import parse_datetime, utc_now
 from huldra.worker import HuldraWorker, WorkerPassResult
 
@@ -37,6 +39,13 @@ def _settings(db: Path | None = None) -> HuldraSettings:
     if db is None:
         return settings
     return settings.model_copy(update={"db_path": db.expanduser()})
+
+
+def _parse_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter("expected YYYY-MM-DD") from exc
 
 
 def _worker_sleep_seconds(result: WorkerPassResult, settings: HuldraSettings) -> float:
@@ -183,6 +192,93 @@ def query(
         timeout_seconds=timeout_seconds,
     )
     payload = broker.ensure(request).model_dump(mode="json")
+    if json_output:
+        _print_json(payload)
+    else:
+        typer.echo(payload)
+
+
+@app.command()
+def sync(
+    db: Annotated[Path | None, typer.Option("--db", help="SQLite database path.")] = None,
+    search_query: Annotated[
+        list[str] | None,
+        typer.Option("--search-query", help="arXiv search_query. Repeat for multiple queries."),
+    ] = None,
+    date_value: Annotated[
+        str | None,
+        typer.Option("--date", help="Submitted-date UTC day to sync."),
+    ] = None,
+    max_results: Annotated[int, typer.Option("--max-results", min=1, max=2000)] = 50,
+    client_id: Annotated[str, typer.Option("--client-id", help="Client identifier.")] = "cli-sync",
+    wait: Annotated[bool, typer.Option("--wait", help="Drain this request set inline.")] = False,
+    wait_timeout_seconds: Annotated[
+        float | None,
+        typer.Option("--wait-timeout-seconds", help="Maintenance wait timeout."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    queries = search_query or []
+    if date_value is None:
+        raise typer.BadParameter("--date is required")
+    parsed_date = _parse_date(date_value)
+    requests = build_submitted_date_windows(
+        search_queries=queries,
+        start_date=parsed_date,
+        end_date=parsed_date,
+        max_results=max_results,
+        client_id=client_id,
+    )
+    broker = HuldraBroker(settings=_settings(db))
+    payload = broker.sync_windows(
+        requests,
+        wait=wait,
+        wait_timeout_seconds=wait_timeout_seconds,
+    ).model_dump(mode="json")
+    if json_output:
+        _print_json(payload)
+    else:
+        typer.echo(payload)
+
+
+@app.command()
+def backfill(
+    db: Annotated[Path | None, typer.Option("--db", help="SQLite database path.")] = None,
+    search_query: Annotated[
+        list[str] | None,
+        typer.Option("--search-query", help="arXiv search_query. Repeat for multiple queries."),
+    ] = None,
+    start_date: Annotated[
+        str | None,
+        typer.Option("--start-date", help="First UTC date, inclusive."),
+    ] = None,
+    end_date: Annotated[
+        str | None,
+        typer.Option("--end-date", help="Last UTC date, inclusive."),
+    ] = None,
+    max_results: Annotated[int, typer.Option("--max-results", min=1, max=2000)] = 50,
+    client_id: Annotated[str, typer.Option("--client-id", help="Client identifier.")] = "huldra-backfill",
+    wait: Annotated[bool, typer.Option("--wait", help="Drain this request set inline.")] = False,
+    wait_timeout_seconds: Annotated[
+        float | None,
+        typer.Option("--wait-timeout-seconds", help="Maintenance wait timeout."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    if start_date is None:
+        raise typer.BadParameter("--start-date is required")
+    parsed_start = _parse_date(start_date)
+    resolved_end = _parse_date(end_date) if end_date is not None else parsed_start
+    broker = HuldraBroker(settings=_settings(db))
+    payload = broker.backfill_windows(
+        search_queries=search_query or [],
+        start_date=parsed_start,
+        end_date=resolved_end,
+        max_results=max_results,
+        wait=wait,
+        wait_timeout_seconds=wait_timeout_seconds,
+        client_id=client_id,
+    ).model_dump(mode="json")
     if json_output:
         _print_json(payload)
     else:
