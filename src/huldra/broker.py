@@ -397,7 +397,6 @@ class HuldraBroker:
                 self.store,
                 self.settings,
                 fetcher=self.fetcher,
-                sleep=lambda _: None,
             ).run_once(target_cache_keys=target_keys)
             result = _count_inline_worker_result(result, worker_result)
             if worker_result.status == "idle":

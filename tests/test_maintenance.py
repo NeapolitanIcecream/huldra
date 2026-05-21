@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
+import pytest
+
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
@@ -163,6 +165,39 @@ def test_sync_windows_wait_reports_inline_429_retry_after(
     assert result.retry_after_seconds == 17
     assert result.rate_limited_windows_total == 1
     assert result.requests[0].raw_cache_status == "rate_limited"
+
+
+def test_sync_windows_wait_preserves_limiter_delay_between_inline_requests(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: inline maintenance drains must honor worker limiter sleeps."""
+    sleeps: list[float] = []
+
+    def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("huldra.worker.time.sleep", record_sleep)
+    first = ArxivRequest(client_id="recoleta:test", search_query="cat:cs.AI")
+    second = ArxivRequest(client_id="recoleta:test", search_query="cat:cs.LG")
+    fetcher = FakeFetcher(
+        [
+            FetchResult([make_paper("2401.00001v1")], total_results=1),
+            FetchResult([make_paper("2401.00002v1")], total_results=1),
+        ]
+    )
+    broker = HuldraBroker(store=store, settings=settings, fetcher=fetcher)
+
+    result = broker.sync_windows([first, second], wait=True, wait_timeout_seconds=10)
+
+    limiter_sleeps = [
+        seconds for seconds in sleeps if seconds >= settings.request_interval_seconds - 0.5
+    ]
+    assert result.completed_windows_total == 2
+    assert result.upstream_requests_total == 2
+    assert fetcher.calls == 2
+    assert limiter_sleeps
 
 
 def test_sync_windows_reports_queued_retry_for_unreadable_completed_cache(
