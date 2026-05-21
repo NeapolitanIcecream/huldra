@@ -16,8 +16,10 @@ class HuldraQueue:
         *,
         owner_token: str,
         claim_timeout_seconds: int = 300,
+        cache_keys: set[str] | frozenset[str] | None = None,
     ) -> QueueItem | None:
         return self.store.claim_next_queue_item(
             owner_token=owner_token,
             claim_timeout_seconds=claim_timeout_seconds,
+            cache_keys=cache_keys,
         )

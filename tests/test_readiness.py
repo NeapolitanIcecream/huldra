@@ -6,7 +6,7 @@ from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest, ReadinessMode
+from huldra.models import ArxivRequest, CachePolicy, ReadinessMode
 from tests.conftest import make_paper
 
 
@@ -36,8 +36,13 @@ def test_current_utc_day_completed_cache_is_not_analysis_ready(
     _record(store, request)
     result = HuldraBroker(store=store, settings=settings).ensure(request)
     assert result.status == "immature"
-    assert result.ready
+    assert not result.ready
     assert not result.analysis_ready
+    assert result.cache_readable
+    assert not result.mature
+    assert result.papers == []
+    assert result.papers_total == 0
+    assert result.cached_papers_total == 1
     assert result.blocked_reason == "immature_window"
 
 
@@ -58,6 +63,8 @@ def test_yesterday_utc_day_completed_cache_is_analysis_ready(
     result = HuldraBroker(store=store, settings=settings).ensure(request)
     assert result.status == "ready"
     assert result.analysis_ready
+    assert result.ready
+    assert result.mature
 
 
 def test_id_list_completed_cache_marks_maturity_not_applicable(
@@ -73,6 +80,7 @@ def test_id_list_completed_cache_marks_maturity_not_applicable(
     result = HuldraBroker(store=store, settings=settings).ensure(request)
     assert result.status == "ready"
     assert not result.maturity_applicable
+    assert result.mature
 
 
 def test_analysis_ready_request_uses_caller_readiness_on_raw_cache_hit(
@@ -98,13 +106,13 @@ def test_analysis_ready_request_uses_caller_readiness_on_raw_cache_hit(
     result = HuldraBroker(store=store, settings=settings).ensure(analysis_request)
 
     assert result.status == "immature"
-    assert result.ready
+    assert not result.ready
     assert not result.analysis_ready
     assert result.maturity_applicable
     assert result.blocked_reason == "immature_window"
 
 
-def test_raw_completed_request_can_use_analysis_ready_cache_without_maturity_gate(
+def test_raw_completed_request_can_use_analysis_ready_cache_and_reports_maturity_facts(
     store: HuldraStore,
     settings: HuldraSettings,
 ) -> None:
@@ -128,5 +136,60 @@ def test_raw_completed_request_can_use_analysis_ready_cache_without_maturity_gat
 
     assert result.status == "ready"
     assert result.ready
+    assert not result.analysis_ready
+    assert result.maturity_applicable
+    assert not result.mature
+    assert result.blocked_reason == "immature_window"
+    assert result.papers_total == 1
+
+
+def test_maturity_lag_zero_disables_current_day_blocking(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    request = ArxivRequest(
+        client_id="analysis",
+        search_query="cat:cs.AI",
+        submitted_start=today,
+        submitted_end=today + timedelta(days=1),
+        readiness=ReadinessMode.ANALYSIS_READY,
+        maturity_lag_days=0,
+    )
+    _record(store, request)
+
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert result.status == "ready"
+    assert result.ready
     assert result.analysis_ready
     assert not result.maturity_applicable
+    assert result.mature
+    assert result.maturity_cutoff is None
+
+
+def test_analysis_ready_stale_refresh_for_immature_window_suppresses_papers(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    request = ArxivRequest(
+        client_id="analysis",
+        search_query="cat:cs.AI",
+        submitted_start=today,
+        submitted_end=today + timedelta(days=1),
+        readiness=ReadinessMode.ANALYSIS_READY,
+        cache_policy=CachePolicy.STALE_WHILE_REVALIDATE,
+    )
+    _record(store, request)
+
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert result.status == "immature"
+    assert result.stale
+    assert not result.ready
+    assert not result.analysis_ready
+    assert result.papers == []
+    assert result.papers_total == 0
+    assert result.cached_papers_total == 1
+    assert result.request_id is not None

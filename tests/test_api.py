@@ -43,8 +43,34 @@ def test_api_get_result_and_paper_from_completed_cache(
         papers=[make_paper("2401.00001v1")],
     )
     client = TestClient(create_app(settings))
-    assert client.get(f"/v1/results/{key}").json()["papers_total"] == 1
+    result = client.get(f"/v1/results/{key}").json()
+    assert result["serving_mode"] == "raw_inspection"
+    assert result["papers_total"] == 1
+    assert "analysis_ready" not in result
     assert client.get("/v1/papers/2401.00001v1").json()["title"] == "Test Paper"
+
+
+def test_api_raw_inspection_reports_failures_without_readiness_blocked_reason(
+    settings: HuldraSettings,
+) -> None:
+    store = HuldraStore(settings.db_path)
+    store.init_schema()
+    request = ArxivRequest(client_id="api", search_query="cat:cs.AI")
+    key = request_cache_key(request)
+    store.record_cache_failure(
+        cache_key=key,
+        request=request,
+        error_category="non_retryable",
+        error_message="bad request",
+        upstream_status=400,
+    )
+
+    result = TestClient(create_app(settings)).get(f"/v1/results/{key}").json()
+
+    assert result["serving_mode"] == "raw_inspection"
+    assert result["status"] == "failed"
+    assert result["blocked_reason"] is None
+    assert result["error_category"] == "non_retryable"
 
 
 def test_api_get_paper_supports_old_style_arxiv_id_with_slash(
@@ -77,3 +103,38 @@ def test_api_serializes_cooldown_status(settings: HuldraSettings) -> None:
     payload = client.get("/v1/status").json()
     assert payload["cooldown_active"] is True
     assert payload["cooldown_until"].replace("Z", "+00:00") == cooldown.isoformat()
+
+
+def test_api_sync_endpoint_returns_maintenance_summary(settings: HuldraSettings) -> None:
+    client = TestClient(create_app(settings))
+
+    response = client.post(
+        "/v1/sync",
+        json={"requests": [{"client_id": "api", "search_query": "cat:cs.AI"}]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["requested_total"] == 1
+    assert payload["queued_total"] == 1
+    assert payload["requests"][0]["raw_cache_status"] == "queued"
+
+
+def test_api_backfill_endpoint_plans_windows(settings: HuldraSettings) -> None:
+    client = TestClient(create_app(settings))
+
+    response = client.post(
+        "/v1/backfill",
+        json={
+            "search_queries": ["cat:cs.AI"],
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "max_results": 10,
+            "wait": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["requested_total"] == 2
+    assert payload["queued_total"] == 2

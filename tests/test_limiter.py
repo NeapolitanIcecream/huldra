@@ -88,3 +88,33 @@ def test_upstream_429_total_survives_success_after_cooldown(
     assert store.status_summary(now=now + timedelta(seconds=11)).upstream_429_total == 1
     state = store.get_rate_state()
     assert state.consecutive_429_total == 0
+
+
+def test_lease_timeout_covers_rate_wait_and_request_timeout(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    tuned = settings.model_copy(
+        update={
+            "request_interval_seconds": 10.0,
+            "request_timeout_seconds": 30.0,
+            "lease_timeout_seconds": 5,
+        }
+    )
+    store.set_rate_state(RateState(last_request_at=now))
+
+    decision = HuldraRateLimiter(store, tuned).before_request(
+        owner_token="w1",
+        now=now + timedelta(seconds=1),
+    )
+
+    assert decision.can_fetch
+    assert not HuldraRateLimiter(store, tuned).before_request(
+        owner_token="w2",
+        now=now + timedelta(seconds=30),
+    ).can_fetch
+    assert HuldraRateLimiter(store, tuned).before_request(
+        owner_token="w2",
+        now=now + timedelta(seconds=45),
+    ).can_fetch

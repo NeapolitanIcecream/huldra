@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
+from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.fetcher import FetchResult, RateLimitedError, TransientFetchError
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest, CachePolicy
+from huldra.models import ArxivRequest, CachePolicy, QueueWorkKind
 from huldra.time import utc_now
 from huldra.worker import HuldraWorker
 from tests.conftest import make_paper
@@ -91,6 +92,66 @@ def test_refresh_429_preserves_old_completed_cache(
     assert entry is not None
     assert entry.status == "completed"
     assert store.get_cached_papers(key)[0].arxiv_id == "2401.00001v1"
+    assert fetcher.calls == 1
+
+
+def test_stale_request_records_durable_refresh_work_kind(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = ArxivRequest(
+        client_id="demo",
+        search_query="cat:cs.AI",
+        cache_policy=CachePolicy.STALE_WHILE_REVALIDATE,
+    )
+    key = request_cache_key(request)
+    store.record_completed_cache_entry(cache_key=key, request=request, papers=[make_paper()])
+
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert result.stale
+    assert result.request_id is not None
+    item = store.get_queue_item(result.request_id)
+    assert item is not None
+    assert item.work_kind == QueueWorkKind.REFRESH_COMPLETED
+
+
+def test_refresh_work_fetches_even_when_completed_cache_exists(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = ArxivRequest(
+        client_id="demo",
+        search_query="cat:cs.AI",
+        cache_policy=CachePolicy.STALE_WHILE_REVALIDATE,
+    )
+    key = request_cache_key(request)
+    store.record_completed_cache_entry(cache_key=key, request=request, papers=[make_paper("2401.00001v1")])
+    store.enqueue_request(request, key)
+    fetcher = FakeFetcher([FetchResult([make_paper("2401.00002v1")], total_results=1)])
+
+    result = HuldraWorker(store, settings, fetcher=fetcher, sleep=lambda _: None).run_once()
+
+    assert result.status == "completed"
+    assert fetcher.calls == 1
+    assert store.get_cached_papers(key)[0].arxiv_id == "2401.00002v1"
+
+
+def test_normal_pending_item_is_promoted_to_refresh_work(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    base = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
+    key = request_cache_key(base)
+    normal = store.enqueue_request(base, key)
+    stale = base.model_copy(update={"cache_policy": CachePolicy.STALE_WHILE_REVALIDATE})
+
+    refreshed = store.enqueue_request(stale, key)
+
+    assert refreshed.request_id == normal.request_id
+    item = store.get_queue_item(normal.request_id)
+    assert item is not None
+    assert item.work_kind == QueueWorkKind.REFRESH_COMPLETED
 
 
 def test_worker_recovers_stale_claim(

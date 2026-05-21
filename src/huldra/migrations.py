@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
@@ -65,6 +65,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             request_json TEXT NOT NULL,
             priority INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
+            work_kind TEXT NOT NULL DEFAULT 'fetch_missing',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             claimed_by TEXT,
@@ -100,6 +101,14 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             expires_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS id_fetch_reservations (
+            arxiv_id TEXT PRIMARY KEY,
+            owner_token TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS worker_state (
             name TEXT PRIMARY KEY,
             last_started_at TEXT,
@@ -119,6 +128,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_rate_state_upstream_429_total(conn)
+    _ensure_queue_items_work_kind(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))"
     )
@@ -143,4 +153,15 @@ def _ensure_rate_state_upstream_429_total(conn: sqlite3.Connection) -> None:
         UPDATE rate_state
         SET upstream_429_total = MAX(upstream_429_total, consecutive_429_total)
         """
+    )
+
+
+def _ensure_queue_items_work_kind(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(queue_items)").fetchall()
+    }
+    if "work_kind" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE queue_items ADD COLUMN work_kind TEXT NOT NULL DEFAULT 'fetch_missing'"
     )

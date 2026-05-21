@@ -41,6 +41,7 @@ def test_client_status_and_ensure_search_use_http_api() -> None:
                     "status": "queued",
                     "cache_key": "huldra:v1:abc",
                     "papers_total": 0,
+                    "future_field": "ignored-by-older-clients",
                 },
             )
         return httpx.Response(404)
@@ -54,6 +55,7 @@ def test_client_status_and_ensure_search_use_http_api() -> None:
     assert client.status().queue_depth_total == 0
     result = client.ensure_search(search_query="cat:cs.AI", max_results=1, wait=True)
     assert result.status == "queued"
+    assert result.model_extra == {"future_field": "ignored-by-older-clients"}
     assert requests[-1].url.params["wait"] == "true"
 
 
@@ -104,3 +106,42 @@ def test_client_get_paper_reads_old_style_id_from_real_app(
 
     assert paper is not None
     assert paper.arxiv_id == "hep-th/9901001v1"
+
+
+def test_client_sync_windows_uses_http_api() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sync":
+            return httpx.Response(
+                200,
+                json={
+                    "requested_total": 1,
+                    "queued_total": 1,
+                    "cache_miss_total": 1,
+                    "requests": [
+                        {
+                            "cache_key": "huldra:v1:abc",
+                            "search_query": "cat:cs.AI",
+                            "raw_cache_status": "queued",
+                            "serving_status": "queued",
+                            "papers_total": 0,
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    client = HuldraClient(
+        client=httpx.Client(
+            base_url="http://testserver",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    result = client.sync_windows([ArxivRequest(client_id="demo", search_query="cat:cs.AI")])
+
+    assert result.requested_total == 1
+    assert result.requests[0].raw_cache_status == "queued"
+    assert requests[0].url.path == "/v1/sync"

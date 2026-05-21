@@ -74,10 +74,38 @@ Read a completed result:
 uv run huldra result --db ~/.local/share/huldra/huldra.db --cache-key KEY --json
 ```
 
+`huldra result` is a raw cache inspection command. It reports whether the
+stored cache entry is readable and returns cached papers when it can. It does
+not reinterpret the cache for a caller's `analysis_ready` policy.
+
 Look up one cached paper:
 
 ```bash
 uv run huldra paper --db ~/.local/share/huldra/huldra.db --arxiv-id 2401.00001 --json
+```
+
+Sync a submitted-date UTC day and optionally wait for the worker path inline:
+
+```bash
+uv run huldra sync \
+  --db ~/.local/share/huldra/huldra.db \
+  --search-query 'cat:cs.AI AND all:agent' \
+  --date 2026-05-20 \
+  --max-results 60 \
+  --wait \
+  --json
+```
+
+Backfill daily submitted-date windows:
+
+```bash
+uv run huldra backfill \
+  --db ~/.local/share/huldra/huldra.db \
+  --search-query 'cat:cs.AI' \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-20 \
+  --max-results 60 \
+  --json
 ```
 
 ## Python Client
@@ -93,6 +121,60 @@ with HuldraClient(base_url="http://127.0.0.1:8765") as client:
     )
     print(result.status, result.papers_total)
 ```
+
+For Recoleta-style pre-syncs, call the maintenance surface instead of shelling
+out to the CLI:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+from huldra.client import HuldraClient
+from huldra.models import ArxivRequest, CachePolicy, ReadinessMode
+
+day = datetime(2026, 5, 20, tzinfo=UTC)
+request = ArxivRequest(
+    client_id="recoleta:embodied_ai",
+    search_query="cat:cs.AI",
+    submitted_start=day,
+    submitted_end=day + timedelta(days=1),
+    max_results=60,
+    cache_policy=CachePolicy.CACHE_ONLY,
+    readiness=ReadinessMode.ANALYSIS_READY,
+)
+
+with HuldraClient(base_url="http://127.0.0.1:8765") as client:
+    summary = client.sync_windows([request], wait=True, wait_timeout_seconds=30)
+    print(summary.completed_windows_total, summary.upstream_requests_total)
+```
+
+Maintenance completion means the raw cache is readable. The per-request
+`serving_status` still tells you whether the same cache is currently accepted
+by the request's readiness mode.
+
+## Safe Readiness
+
+Use `readiness="analysis_ready"` for ingestion paths that must not consume
+immature submitted-date windows. If a completed window is still inside the
+maturity lag, Huldra returns:
+
+- `status="immature"`
+- `ready=false`
+- `analysis_ready=false`
+- `blocked_reason="immature_window"`
+- an empty `papers` list
+- `cached_papers_total` with the number of suppressed cached papers
+
+Use `readiness="raw_completed"` for exploratory reads that may inspect same-day
+metadata. Raw reads can return papers from an immature window, but they still
+report `analysis_ready=false`, `mature=false`, and
+`blocked_reason="immature_window"`.
+
+Set request-level `maturity_lag_days=0` only when the caller explicitly wants
+to disable maturity blocking. This field changes readiness interpretation; it
+does not change the cache key.
+
+Submitted-date bounds must be UTC minute-aligned. Huldra rejects bounds with
+seconds or microseconds instead of silently widening or narrowing the window.
 
 ## HTTP API
 

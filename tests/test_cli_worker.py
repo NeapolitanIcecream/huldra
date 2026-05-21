@@ -71,3 +71,46 @@ def test_worker_cli_does_not_sleep_between_successful_passes(
     assert result.output.count("'status': 'cache_hit'") == 1
     assert result.output.count("'status': 'idle'") == 1
     assert sleep_calls == [7.0]
+
+
+def test_sync_and_backfill_cli_emit_json_summaries(tmp_path: Path) -> None:
+    db = tmp_path / "huldra.db"
+    runner = CliRunner()
+
+    sync = runner.invoke(
+        cli.app,
+        [
+            "sync",
+            "--db",
+            str(db),
+            "--search-query",
+            "cat:cs.AI",
+            "--date",
+            "2026-01-01",
+            "--max-results",
+            "10",
+            "--json",
+        ],
+    )
+    backfill = runner.invoke(
+        cli.app,
+        [
+            "backfill",
+            "--db",
+            str(db),
+            "--search-query",
+            "cat:cs.LG",
+            "--start-date",
+            "2026-01-01",
+            "--end-date",
+            "2026-01-02",
+            "--max-results",
+            "10",
+            "--json",
+        ],
+    )
+
+    assert sync.exit_code == 0
+    assert json.loads(sync.output)["requested_total"] == 1
+    assert backfill.exit_code == 0
+    assert json.loads(backfill.output)["requested_total"] == 2
