@@ -102,7 +102,7 @@ class HuldraRateLimiter:
         now: datetime | None = None,
     ) -> datetime:
         current = ensure_utc(now or utc_now())
-        seconds = retry_after_seconds or self.settings.cooldown_seconds
+        seconds = self.settings.cooldown_seconds if retry_after_seconds is None else retry_after_seconds
         previous = self.store.get_rate_state(self.name)
         cooldown_until = current + timedelta(seconds=seconds)
         self.store.set_rate_state(

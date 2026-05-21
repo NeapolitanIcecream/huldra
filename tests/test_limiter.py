@@ -58,6 +58,21 @@ def test_after_429_persists_cooldown(
     assert store.get_rate_state().cooldown_until == cooldown
 
 
+def test_after_429_honors_zero_retry_after(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: Retry-After: 0 was replaced by the default cooldown."""
+    limiter = HuldraRateLimiter(store, settings)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    assert limiter.before_request(owner_token="w1", now=now).can_fetch
+
+    cooldown = limiter.after_429(owner_token="w1", retry_after_seconds=0, now=now)
+
+    assert cooldown == now
+    assert store.get_rate_state().cooldown_until == cooldown
+
+
 def test_upstream_429_total_survives_success_after_cooldown(
     store: HuldraStore,
     settings: HuldraSettings,

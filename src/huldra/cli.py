@@ -14,8 +14,8 @@ from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import normalize_arxiv_id
 from huldra.models import ArxivRequest, CachePolicy
-from huldra.time import parse_datetime
-from huldra.worker import HuldraWorker
+from huldra.time import parse_datetime, utc_now
+from huldra.worker import HuldraWorker, WorkerPassResult
 
 app = typer.Typer(
     help="Huldra: local arXiv metadata broker.",
@@ -24,6 +24,8 @@ app = typer.Typer(
 )
 store_app = typer.Typer(help="Manage the Huldra SQLite store.", no_args_is_help=True)
 app.add_typer(store_app, name="store")
+
+_IMMEDIATE_WORKER_STATUSES = frozenset({"cache_hit", "completed", "failed"})
 
 
 def _print_json(payload: object) -> None:
@@ -35,6 +37,14 @@ def _settings(db: Path | None = None) -> HuldraSettings:
     if db is None:
         return settings
     return settings.model_copy(update={"db_path": db.expanduser()})
+
+
+def _worker_sleep_seconds(result: WorkerPassResult, settings: HuldraSettings) -> float:
+    if result.status in _IMMEDIATE_WORKER_STATUSES:
+        return 0.0
+    if result.cooldown_until is not None:
+        return max(0.0, (result.cooldown_until - utc_now()).total_seconds())
+    return settings.worker_poll_interval_seconds
 
 
 @app.command()
@@ -89,7 +99,9 @@ def worker(
             typer.echo(payload)
         if once:
             return
-        time.sleep(settings.worker_poll_interval_seconds)
+        sleep_seconds = _worker_sleep_seconds(result, settings)
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
 
 
 @app.command()
