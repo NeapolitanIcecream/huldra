@@ -19,7 +19,7 @@ from huldra.fetcher import (
     RateLimitedError,
     TransientFetchError,
 )
-from huldra.keys import normalize_arxiv_id
+from huldra.keys import arxiv_version, normalize_arxiv_id
 from huldra.limiter import HuldraRateLimiter
 from huldra.models import ArxivPaper, ArxivRequest, CachePolicy, QueueItem, QueueWorkKind, RequestStatus
 from huldra.time import utc_now
@@ -312,8 +312,7 @@ class HuldraWorker:
         papers = result.papers
         total_results = result.total_results
         if id_plan is not None:
-            papers_by_id = dict(id_plan.papers_by_id or {})
-            papers_by_id.update({paper.arxiv_id: paper for paper in result.papers})
+            papers_by_id = _id_list_paper_lookup(id_plan.papers_by_id or {}, result.papers)
             missing_after_fetch = [
                 arxiv_id for arxiv_id in id_plan.requested_ids if arxiv_id not in papers_by_id
             ]
@@ -349,7 +348,7 @@ class HuldraWorker:
                     error_category="non_retryable",
                     error_message="upstream response omitted requested IDs",
                 )
-            papers = [papers_by_id[arxiv_id] for arxiv_id in id_plan.requested_ids]
+            papers = _ordered_id_list_papers(id_plan.requested_ids, papers_by_id)
             total_results = len(papers)
 
         self.store.record_completed_cache_entry(
@@ -425,3 +424,45 @@ def _is_pure_id_list_request(request: ArxivRequest) -> bool:
         and request.sort_order == "descending"
         and request.max_results >= len(request.id_list)
     )
+
+
+def _id_list_paper_lookup(
+    cached_papers_by_id: dict[str, ArxivPaper],
+    fetched_papers: list[ArxivPaper],
+) -> dict[str, ArxivPaper]:
+    lookup = dict(cached_papers_by_id)
+    for paper in cached_papers_by_id.values():
+        _add_id_list_paper_lookup(lookup, paper)
+    for paper in fetched_papers:
+        _add_id_list_paper_lookup(lookup, paper)
+    return lookup
+
+
+def _add_id_list_paper_lookup(lookup: dict[str, ArxivPaper], paper: ArxivPaper) -> None:
+    arxiv_id = normalize_arxiv_id(paper.arxiv_id)
+    lookup[arxiv_id] = paper
+    versionless_id = _versionless_arxiv_id(arxiv_id)
+    if versionless_id != arxiv_id:
+        lookup.setdefault(versionless_id, paper)
+
+
+def _ordered_id_list_papers(
+    requested_ids: tuple[str, ...],
+    papers_by_id: dict[str, ArxivPaper],
+) -> list[ArxivPaper]:
+    papers: list[ArxivPaper] = []
+    seen: set[str] = set()
+    for arxiv_id in requested_ids:
+        paper = papers_by_id[arxiv_id]
+        if paper.arxiv_id in seen:
+            continue
+        seen.add(paper.arxiv_id)
+        papers.append(paper)
+    return papers
+
+
+def _versionless_arxiv_id(arxiv_id: str) -> str:
+    version = arxiv_version(arxiv_id)
+    if version is None:
+        return arxiv_id
+    return arxiv_id[: -len(f"v{version}")]

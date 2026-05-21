@@ -126,6 +126,55 @@ def test_id_list_worker_deduplicates_repeated_ids_before_composed_cache_write(
     assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
 
 
+def test_id_list_worker_accepts_versioned_upstream_id_for_versionless_request(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: versionless ID-list requests failed when arXiv returned a versioned ID."""
+    request = ArxivRequest(
+        client_id="demo",
+        id_list=("2401.00001",),
+        cache_policy=CachePolicy.WAIT_UNTIL_READY,
+    )
+    store.enqueue_request(request)
+    fetcher = CapturingFetcher(
+        responses=[FetchResult([make_paper("2401.00001v1")], total_results=1)],
+        seen=[],
+    )
+
+    worker_result = HuldraWorker(store, settings, fetcher=fetcher, sleep=lambda _: None).run_once()
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert worker_result.status == "completed"
+    assert [seen.id_list for seen in fetcher.seen] == [("2401.00001",)]
+    assert result.status == "ready"
+    assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
+
+
+def test_id_list_worker_deduplicates_versionless_alias_before_composed_cache_write(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: versionless and versioned aliases could write duplicate cache matches."""
+    request = ArxivRequest(
+        client_id="demo",
+        id_list=("2401.00001", "2401.00001v1"),
+        cache_policy=CachePolicy.WAIT_UNTIL_READY,
+    )
+    store.enqueue_request(request)
+    fetcher = CapturingFetcher(
+        responses=[FetchResult([make_paper("2401.00001v1")], total_results=1)],
+        seen=[],
+    )
+
+    worker_result = HuldraWorker(store, settings, fetcher=fetcher, sleep=lambda _: None).run_once()
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert worker_result.status == "completed"
+    assert result.status == "ready"
+    assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
+
+
 def test_reordered_cold_id_list_requests_do_not_duplicate_upstream_fetches(
     store: HuldraStore,
     settings: HuldraSettings,
