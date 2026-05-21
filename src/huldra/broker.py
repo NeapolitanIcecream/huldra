@@ -20,6 +20,8 @@ from huldra.time import ensure_utc, utc_now
 
 log = logger.bind(module="huldra.broker")
 
+_PENDING_QUEUE_STATUSES = frozenset({"queued", "delayed", "claimed"})
+
 
 class HuldraBroker:
     def __init__(
@@ -121,7 +123,9 @@ class HuldraBroker:
                     readiness_request=request,
                 )
             if entry and entry.status in {"failed", "rate_limited"}:
-                return self.get_result(cache_key).model_copy(update={"request_id": request_id})
+                item = self.store.get_queue_item(request_id)
+                if item is None or item.status not in _PENDING_QUEUE_STATUSES:
+                    return self.get_result(cache_key).model_copy(update={"request_id": request_id})
             time.sleep(min(0.1, max(0.01, timeout / 50)))
         log.bind(cache_key=cache_key, request_id=request_id).info("request_wait_timeout")
         return ArxivResult(

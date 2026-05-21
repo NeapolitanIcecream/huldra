@@ -148,6 +148,26 @@ def test_worker_transient_failure_records_error_diagnostics(
     assert "temporary outage" in (status.worker_last_error_message or "")
 
 
+def test_worker_transient_failure_returns_retry_wake_time(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: CLI loop needs the transient retry wake time to avoid idle polling."""
+    store.enqueue_request(ArxivRequest(client_id="demo", search_query="cat:cs.AI"))
+    fetcher = FakeFetcher([TransientFetchError("temporary outage", status_code=503)])
+
+    result = HuldraWorker(store, settings, fetcher=fetcher, sleep=lambda _: None).run_once()
+
+    assert result.status == "transient_failure"
+    assert result.cooldown_until is not None
+    status = store.status_summary()
+    assert result.cooldown_until == status.worker_next_wake_at
+    assert result.request_id is not None
+    queued = store.get_queue_item(result.request_id)
+    assert queued is not None
+    assert queued.next_attempt_at == result.cooldown_until
+
+
 def test_worker_cache_hit_records_completion(
     store: HuldraStore,
     settings: HuldraSettings,

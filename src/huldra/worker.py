@@ -192,6 +192,7 @@ class HuldraWorker:
                 status="transient_failure",
                 request_id=item.request_id,
                 cache_key=item.cache_key,
+                cooldown_until=next_attempt,
                 error_category="transient",
                 error_message=str(exc),
             )
