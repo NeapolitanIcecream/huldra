@@ -1,0 +1,104 @@
+# Run Huldra Locally
+
+Huldra runs in the foreground. Use your process manager to keep it alive.
+
+## Foreground
+
+```bash
+uv run huldra store init --db ~/.local/share/huldra/huldra.db
+uv run huldra daemon --db ~/.local/share/huldra/huldra.db --host 127.0.0.1 --port 8765
+```
+
+Run the worker in another supervised process:
+
+```bash
+uv run huldra worker --db ~/.local/share/huldra/huldra.db --poll-interval-seconds 300 --json
+```
+
+Check status:
+
+```bash
+uv run huldra status --db ~/.local/share/huldra/huldra.db --json
+```
+
+The status payload shows `cooldown_until` and `cooldown_active` so supervisors
+can tell when arXiv returned HTTP 429 and the worker is waiting.
+
+## systemd User Service
+
+```ini
+[Unit]
+Description=Huldra arXiv metadata API
+
+[Service]
+WorkingDirectory=%h/gits/huldra
+ExecStart=uv run huldra daemon --db %h/.local/share/huldra/huldra.db --host 127.0.0.1 --port 8765
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Create a second service for the worker:
+
+```ini
+[Unit]
+Description=Huldra arXiv metadata worker
+
+[Service]
+WorkingDirectory=%h/gits/huldra
+ExecStart=uv run huldra worker --db %h/.local/share/huldra/huldra.db --poll-interval-seconds 300 --json
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+## launchd
+
+Use one plist for the API and one for the worker. Keep `RunAtLoad` enabled and
+set `KeepAlive` to true.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>tech.voile.huldra.api</string>
+  <key>WorkingDirectory</key><string>/Users/chenmohan/gits/huldra</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>uv</string><string>run</string><string>huldra</string>
+    <string>daemon</string>
+    <string>--db</string><string>/Users/chenmohan/.local/share/huldra/huldra.db</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+## Docker
+
+The MVP does not require Docker. If you containerize it, mount a persistent
+volume for `/data/huldra.db`, bind the service to `127.0.0.1` on the host, and
+run one API process plus one worker process against the same database.
+
+## Backup And Cleanup
+
+Stop the API and worker, then copy the SQLite files:
+
+```bash
+cp ~/.local/share/huldra/huldra.db* /path/to/backup/
+```
+
+Huldra does not implement retention cleanup yet. Delete or archive the database
+only when consumers no longer need the cached metadata.
+
+## Multi-Machine Limit
+
+Do not run separate Huldra databases on several machines to increase arXiv
+throughput. The arXiv legacy API limit applies across machines you control.
+Use one centralized broker for the deployment, or wait for a future shared
+rate-state backend.

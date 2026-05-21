@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <entry>
+    <id>http://arxiv.org/abs/2604.27001v2</id>
+    <updated>2026-04-28T12:34:56Z</updated>
+    <published>2026-04-27T11:00:00Z</published>
+    <title>  Pool
+ Paper  </title>
+    <summary>Abstract
+ text.</summary>
+    <author><name>Ada Lovelace</name></author>
+    <author><name>Grace Hopper</name></author>
+    <arxiv:primary_category term="cs.AI" scheme="http://arxiv.org/schemas/atom" />
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom" />
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom" />
+    <arxiv:comment>12 pages</arxiv:comment>
+    <arxiv:journal_ref>Journal Demo</arxiv:journal_ref>
+    <arxiv:doi>10.1234/demo</arxiv:doi>
+    <link href="http://arxiv.org/abs/2604.27001v2" rel="alternate" type="text/html" />
+    <link href="http://arxiv.org/pdf/2604.27001v2" rel="related" type="application/pdf" title="pdf" />
+  </entry>
+</feed>
