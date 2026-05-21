@@ -18,6 +18,7 @@ from huldra.models import (
     CachePolicy,
     HuldraMaintenanceRequestResult,
     HuldraMaintenanceResult,
+    QueueItem,
     QueueWorkKind,
     ReadinessMode,
 )
@@ -27,6 +28,7 @@ from huldra.worker import Fetcher, HuldraWorker, WorkerPassResult
 log = logger.bind(module="huldra.broker")
 
 _PENDING_QUEUE_STATUSES = frozenset({"queued", "delayed", "claimed"})
+_TERMINAL_DELAYED_ERROR_CATEGORIES = frozenset({"cooldown", "rate_limited"})
 _INLINE_UPSTREAM_STATUSES = frozenset({"completed", "rate_limited", "transient_failure", "failed"})
 
 
@@ -245,20 +247,24 @@ class HuldraBroker:
                         request_id=request_id,
                         readiness_request=request,
                     )
+                item = self.store.get_queue_item(request_id)
+                if item is None or _queue_item_has_terminal_outcome(item):
+                    raw = self.get_result(cache_key)
+                    return self._result_from_terminal_raw_state(
+                        request,
+                        raw,
+                        request_id=request_id,
+                        queue_item=item,
+                    )
             if entry and entry.status in {"failed", "rate_limited"}:
                 item = self.store.get_queue_item(request_id)
-                if item is None or item.status not in _PENDING_QUEUE_STATUSES:
+                if item is None or _queue_item_has_terminal_outcome(item):
                     raw = self.get_result(cache_key)
-                    return ArxivResult(
-                        serving_mode=request.readiness,
-                        status=raw.status,
-                        cache_key=cache_key,
+                    return self._result_from_terminal_raw_state(
+                        request,
+                        raw,
                         request_id=request_id,
-                        cooldown_until=raw.cooldown_until,
-                        blocked_reason=raw.blocked_reason,
-                        error_category=raw.error_category,
-                        error_message=raw.error_message,
-                        upstream_status=raw.upstream_status,
+                        queue_item=item,
                     )
             time.sleep(min(0.1, max(0.01, timeout / 50)))
         log.bind(cache_key=cache_key, request_id=request_id).info("request_wait_timeout")
@@ -307,6 +313,49 @@ class HuldraBroker:
             completed_at=entry.completed_at,
             cooldown_until=entry.cooldown_until,
             upstream_status=entry.upstream_status,
+        )
+
+    def _result_from_terminal_raw_state(
+        self,
+        request: ArxivRequest,
+        raw: ArxivRawInspectionResult,
+        *,
+        request_id: str,
+        queue_item: QueueItem | None,
+    ) -> ArxivResult:
+        status = raw.status
+        cooldown_until = raw.cooldown_until
+        blocked_reason = raw.blocked_reason
+        error_category = raw.error_category
+        error_message = raw.error_message
+        if queue_item is not None:
+            if queue_item.status == "failed":
+                status = "failed"
+            elif (
+                queue_item.status == "delayed"
+                and queue_item.error_category in _TERMINAL_DELAYED_ERROR_CATEGORIES
+            ):
+                status = "cooling_down"
+                blocked_reason = queue_item.error_category
+            cooldown_until = queue_item.next_attempt_at or cooldown_until
+            error_category = queue_item.error_category or error_category
+            error_message = queue_item.error_message or error_message
+        return ArxivResult(
+            serving_mode=request.readiness,
+            status=status,
+            cache_key=raw.cache_key,
+            request_id=request_id,
+            papers=raw.papers,
+            papers_total=raw.papers_total,
+            total_results=raw.total_results,
+            cache_hit=raw.cache_hit,
+            cache_readable=raw.cache_readable,
+            cooldown_until=cooldown_until,
+            blocked_reason=blocked_reason,
+            error_category=error_category,
+            error_message=error_message,
+            completed_at=raw.completed_at,
+            upstream_status=raw.upstream_status,
         )
 
     def _try_compose_cached_id_list(self, request: ArxivRequest, cache_key: str) -> ArxivResult | None:
@@ -364,9 +413,7 @@ class HuldraBroker:
         if target.request_id is None:
             return False
         item = self.store.get_queue_item(target.request_id)
-        if item is not None and item.status == "delayed" and item.error_category == "cooldown":
-            return True
-        return item is not None and item.status not in _PENDING_QUEUE_STATUSES
+        return _queue_item_has_terminal_outcome(item)
 
     def _finalize_maintenance_result(
         self,
@@ -403,33 +450,33 @@ class HuldraBroker:
                 completed_total += 1
                 papers_total += readable.result_count
             elif cache_entry is None:
-                raw_status = str(queue_item.status) if queue_item is not None else "missing"
-                if queue_item is not None and queue_item.error_category == "cooldown":
-                    raw_status = "skipped"
-                    skipped_total += 1
-            elif cache_entry.status == "rate_limited":
-                raw_status = "rate_limited"
-                rate_limited_total += 1
-            elif cache_entry.status == "failed":
-                raw_status = "failed"
-                failed_total += 1
+                raw_status = _raw_status_from_queue_item(queue_item) or "missing"
+            elif cache_entry.status == "completed":
+                raw_status = _unreadable_completed_raw_status(queue_item)
             else:
                 raw_status = cache_entry.status
+            if readable is None:
+                if raw_status == "skipped":
+                    skipped_total += 1
+                elif raw_status == "rate_limited":
+                    rate_limited_total += 1
+                elif raw_status in {"failed", "cache_unreadable"}:
+                    failed_total += 1
             if cache_entry is not None and cache_entry.cooldown_until is not None:
                 cooldown_until = cache_entry.cooldown_until
                 if cache_entry.cooldown_until > utc_now():
                     cooldown_active_total += 1
-            elif queue_item is not None and queue_item.error_category == "cooldown":
+            elif queue_item is not None and queue_item.error_category in _TERMINAL_DELAYED_ERROR_CATEGORIES:
                 cooldown_until = queue_item.next_attempt_at
                 if queue_item.next_attempt_at is not None and queue_item.next_attempt_at > utc_now():
                     cooldown_active_total += 1
             request_cooldown_until = cache_entry.cooldown_until if cache_entry is not None else None
             request_error_category = cache_entry.error_category if cache_entry is not None else None
             request_error_message = cache_entry.error_message if cache_entry is not None else None
-            if queue_item is not None and cache_entry is None:
-                request_cooldown_until = queue_item.next_attempt_at
-                request_error_category = queue_item.error_category
-                request_error_message = queue_item.error_message
+            if queue_item is not None and (cache_entry is None or cache_entry.status == "completed"):
+                request_cooldown_until = queue_item.next_attempt_at or request_cooldown_until
+                request_error_category = queue_item.error_category or request_error_category
+                request_error_message = queue_item.error_message or request_error_message
             entries.append(
                 HuldraMaintenanceRequestResult(
                     cache_key=target.cache_key,
@@ -516,6 +563,31 @@ def _evaluate_readiness(request: ArxivRequest, settings: HuldraSettings) -> _Rea
         maturity_cutoff=cutoff,
         blocked_reason=None if mature else "immature_window",
     )
+
+
+def _queue_item_has_terminal_outcome(item: QueueItem | None) -> bool:
+    if item is None:
+        return False
+    if item.status not in _PENDING_QUEUE_STATUSES:
+        return True
+    return item.status == "delayed" and item.error_category in _TERMINAL_DELAYED_ERROR_CATEGORIES
+
+
+def _raw_status_from_queue_item(item: QueueItem | None) -> str | None:
+    if item is None:
+        return None
+    if item.status == "delayed" and item.error_category == "cooldown":
+        return "skipped"
+    if item.status == "delayed" and item.error_category == "rate_limited":
+        return "rate_limited"
+    return str(item.status)
+
+
+def _unreadable_completed_raw_status(item: QueueItem | None) -> str:
+    status = _raw_status_from_queue_item(item)
+    if status is None or status == "completed":
+        return "cache_unreadable"
+    return status
 
 
 def _is_pure_id_list_request(request: ArxivRequest) -> bool:

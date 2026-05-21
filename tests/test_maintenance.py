@@ -6,7 +6,8 @@ from datetime import UTC, date, datetime, timedelta
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import FetchResult, RateLimitedError
+from huldra.fetcher import FetchResult, NonRetryableFetchError, RateLimitedError
+from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, CachePolicy, RateState, ReadinessMode
 from huldra.planner import build_submitted_date_windows
 from huldra.time import utc_now
@@ -24,6 +25,14 @@ class FakeFetcher:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def _corrupt_completed_cache(store: HuldraStore, request: ArxivRequest) -> str:
+    key = request_cache_key(request)
+    store.record_completed_cache_entry(cache_key=key, request=request, papers=[make_paper()])
+    with store.begin_immediate() as conn:
+        conn.execute("DELETE FROM cache_matches WHERE cache_key = ?", (key,))
+    return key
 
 
 def test_build_submitted_date_windows_plans_inclusive_daily_ranges() -> None:
@@ -154,3 +163,46 @@ def test_sync_windows_wait_reports_inline_429_retry_after(
     assert result.retry_after_seconds == 17
     assert result.rate_limited_windows_total == 1
     assert result.requests[0].raw_cache_status == "rate_limited"
+
+
+def test_sync_windows_reports_queued_retry_for_unreadable_completed_cache(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: unreadable completed caches must surface pending retry state."""
+    target = ArxivRequest(client_id="recoleta:test", search_query="cat:cs.AI")
+    key = _corrupt_completed_cache(store, target)
+    broker = HuldraBroker(store=store, settings=settings)
+
+    result = broker.sync_windows([target], wait=False)
+
+    assert result.completed_windows_total == 0
+    assert result.queued_total == 1
+    assert result.requests[0].cache_key == key
+    assert result.requests[0].raw_cache_status == "queued"
+    assert result.requests[0].serving_status == "queued"
+
+
+def test_sync_windows_wait_reports_failed_retry_for_unreadable_completed_cache(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    """Regression: failed retries for corrupt completed caches must not look completed."""
+    target = ArxivRequest(
+        client_id="recoleta:test",
+        search_query="cat:cs.AI",
+        timeout_seconds=1,
+    )
+    key = _corrupt_completed_cache(store, target)
+    fetcher = FakeFetcher([NonRetryableFetchError("arXiv API returned HTTP 404", status_code=404)])
+    broker = HuldraBroker(store=store, settings=settings, fetcher=fetcher)
+
+    result = broker.sync_windows([target], wait=True)
+
+    assert result.completed_windows_total == 0
+    assert result.failed_windows_total == 1
+    assert result.upstream_requests_total == 1
+    assert result.requests[0].cache_key == key
+    assert result.requests[0].raw_cache_status == "failed"
+    assert result.requests[0].serving_status == "failed"
+    assert result.requests[0].error_category == "non_retryable"
