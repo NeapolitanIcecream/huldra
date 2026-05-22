@@ -551,7 +551,7 @@ exactly one commit after that step's checks pass.
 ### Step 0: Prepare
 
 ```bash
-cd /Users/chenmohan/gits/huldra
+cd /path/to/huldra
 git checkout -b codex/recoleta-compatible-broker
 uv sync --dev
 uv run ruff check .

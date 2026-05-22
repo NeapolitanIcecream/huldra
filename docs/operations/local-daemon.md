@@ -101,12 +101,12 @@ set `KeepAlive` to true.
 <plist version="1.0">
 <dict>
   <key>Label</key><string>tech.voile.huldra.api</string>
-  <key>WorkingDirectory</key><string>/Users/chenmohan/gits/huldra</string>
+  <key>WorkingDirectory</key><string>/Users/YOUR_USER/gits/huldra</string>
   <key>ProgramArguments</key>
   <array>
     <string>uv</string><string>run</string><string>huldra</string>
     <string>daemon</string>
-    <string>--db</string><string>/Users/chenmohan/.local/share/huldra/huldra.db</string>
+    <string>--db</string><string>/Users/YOUR_USER/.local/share/huldra/huldra.db</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
