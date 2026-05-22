@@ -6,7 +6,7 @@ arXiv papers can ask Huldra for metadata instead of each calling
 durable rate limiter, cooldown state, and upstream lease across those programs.
 
 Huldra is an independent package and CLI. It is not a plugin for another
-project, and it does not depend on Recoleta.
+project, and it does not depend on [Recoleta](https://github.com/NeapolitanIcecream/recoleta).
 
 ## Install
 
