@@ -10,10 +10,22 @@ project, and it does not depend on Recoleta.
 
 ## Install
 
+Install the published package:
+
+```bash
+pip install huldra-arxiv
+huldra --help
+```
+
+For local development:
+
 ```bash
 uv sync --dev
 uv run huldra --help
 ```
+
+The PyPI package name is `huldra-arxiv`. The Python package and CLI command are
+still named `huldra`.
 
 The default database is:
 
