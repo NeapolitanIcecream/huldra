@@ -212,6 +212,7 @@ class HuldraBroker:
             if resumption_token is not None
             else self._oai_start_datestamp(request)
         )
+        until_datestamp = _normalize_oai_day_datestamp(request.until_datestamp)
         page_index = 0
         records_processed = 0
         papers_upserted = 0
@@ -224,7 +225,7 @@ class HuldraBroker:
                 metadata_prefix=request.metadata_prefix,
                 set_spec=request.set_spec,
                 from_datestamp=from_datestamp,
-                until_datestamp=request.until_datestamp,
+                until_datestamp=until_datestamp,
                 resumption_token=resumption_token,
             )
             if not decision.can_fetch:
@@ -257,7 +258,7 @@ class HuldraBroker:
                     metadata_prefix=request.metadata_prefix,
                     set_spec=request.set_spec,
                     from_datestamp=from_datestamp,
-                    until_datestamp=request.until_datestamp,
+                    until_datestamp=until_datestamp,
                     resumption_token=resumption_token,
                 )
             except RateLimitedError as exc:
@@ -347,7 +348,10 @@ class HuldraBroker:
             records_processed += processed
             papers_upserted += upserted
             deleted_records += deleted
-            response_watermark = page.response_date or response_watermark
+            response_watermark = (
+                _normalize_oai_day_datestamp(page.response_date, keep_invalid=False)
+                or response_watermark
+            )
             max_datestamp_seen = _max_datestamp_seen(page.records, max_datestamp_seen)
             self.store.record_oai_page(
                 harvest_id=harvest_id,
@@ -388,7 +392,7 @@ class HuldraBroker:
 
     def _oai_start_datestamp(self, request: OaiHarvestRequest) -> str | None:
         if request.from_datestamp:
-            return request.from_datestamp
+            return _normalize_oai_day_datestamp(request.from_datestamp)
         if request.mode != "incremental":
             return None
         watermark = self.store.get_oai_watermark(
@@ -397,10 +401,14 @@ class HuldraBroker:
         )
         if watermark is None:
             return None
-        raw = watermark.get("last_response_date") or watermark.get("last_datestamp_seen")
-        if raw is None or self.settings.oai_overlap_seconds <= 0:
-            return raw
-        return _subtract_oai_overlap(raw, self.settings.oai_overlap_seconds)
+        for raw in (watermark.get("last_response_date"), watermark.get("last_datestamp_seen")):
+            normalized = _normalize_oai_day_datestamp(raw, keep_invalid=False)
+            if normalized is None:
+                continue
+            if self.settings.oai_overlap_seconds <= 0:
+                return normalized
+            return _subtract_oai_overlap(normalized, self.settings.oai_overlap_seconds)
+        return None
 
     def sync_windows(
         self,
@@ -1187,7 +1195,7 @@ def _max_datestamp_seen(records: Sequence[OaiRecord], current: str | None) -> st
         datestamp = getattr(record, "datestamp", None)
         if datestamp is None:
             continue
-        value = ensure_utc(datestamp).isoformat()
+        value = ensure_utc(datestamp).date().isoformat()
         if best is None or value > best:
             best = value
     return best
@@ -1195,6 +1203,25 @@ def _max_datestamp_seen(records: Sequence[OaiRecord], current: str | None) -> st
 
 def _should_commit_oai_watermark(request: OaiHarvestRequest) -> bool:
     return request.from_datestamp is None and request.until_datestamp is None
+
+
+def _normalize_oai_day_datestamp(
+    value: str | None,
+    *,
+    keep_invalid: bool = True,
+) -> str | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw if keep_invalid else None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).date().isoformat()
 
 
 def _subtract_oai_overlap(value: str, seconds: int) -> str:
@@ -1205,7 +1232,7 @@ def _subtract_oai_overlap(value: str, seconds: int) -> str:
         return value
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return (parsed.astimezone(UTC) - timedelta(seconds=seconds)).isoformat()
+    return (parsed.astimezone(UTC) - timedelta(seconds=seconds)).date().isoformat()
 
 
 def _unreadable_completed_raw_status(item: QueueItem | None) -> str:

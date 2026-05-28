@@ -214,4 +214,4 @@ def test_api_harvest_oai_endpoint_runs_harvest(
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["pages_total"] == 1
-    assert payload["current_watermark"] == "2026-05-28T00:00:00Z"
+    assert payload["current_watermark"] == "2026-05-28"

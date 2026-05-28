@@ -350,12 +350,13 @@ def test_oai_harvest_follows_resumption_token_and_advances_watermark(
     assert result.papers_upserted == 1
     assert result.deleted_records == 1
     assert result.pages_total == 2
-    assert result.current_watermark == "2026-05-29T00:00:00Z"
+    assert result.current_watermark == "2026-05-29"
     assert fetcher.seen[1]["resumption_token"] == "next-token"
     assert store.get_paper("2401.00001") is not None
     watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
     assert watermark is not None
-    assert watermark["last_response_date"] == "2026-05-29T00:00:00Z"
+    assert watermark["last_response_date"] == "2026-05-29"
+    assert watermark["last_datestamp_seen"] == "2026-05-28"
 
 
 def test_oai_failed_page_does_not_advance_watermark(
@@ -416,12 +417,12 @@ def test_oai_harvest_auto_resumes_pending_token_after_rate_limit(
 
     assert resumed.status == "completed"
     assert resumed.records_processed == 1
-    assert resumed.current_watermark == "2026-05-29T00:00:00Z"
+    assert resumed.current_watermark == "2026-05-29"
     assert resume_fetcher.seen[0]["resumption_token"] == "next-token"
     assert resume_fetcher.seen[0]["from_datestamp"] is None
     watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
     assert watermark is not None
-    assert watermark["last_response_date"] == "2026-05-29T00:00:00Z"
+    assert watermark["last_response_date"] == "2026-05-29"
 
     fresh_fetcher = FakeOaiFetcher([final], [])
     fresh = HuldraBroker(
@@ -500,8 +501,79 @@ def test_oai_incremental_harvest_resumes_from_successful_watermark(
     )
 
     assert result.status == "completed"
-    assert fetcher.seen[0]["from_datestamp"] == "2026-05-28T00:00:00Z"
+    assert result.current_watermark == "2026-05-28"
+    assert fetcher.seen[0]["from_datestamp"] == "2026-05-28"
     assert fetcher.seen[0]["set_spec"] == "cs:cs:AI"
+    watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec="cs:cs:AI")
+    assert watermark is not None
+    assert watermark["last_response_date"] == "2026-05-28"
+    assert watermark["last_datestamp_seen"] == "2026-05-27"
+
+
+def test_oai_incremental_overlap_keeps_from_datestamp_day_granularity(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    settings = settings.model_copy(update={"oai_overlap_seconds": 1})
+    store.set_oai_watermark(
+        metadata_prefix="arXiv",
+        set_spec=None,
+        last_response_date="2026-05-28T00:00:00Z",
+        last_datestamp_seen=None,
+        harvest_id="previous",
+    )
+    page = parse_oai_pmh_list_records(
+        OAI_PAGE.replace("<resumptionToken>next-token</resumptionToken>", "")
+    )
+    fetcher = FakeOaiFetcher([page], [])
+
+    result = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INCREMENTAL,
+        )
+    )
+
+    assert result.status == "completed"
+    assert fetcher.seen[0]["from_datestamp"] == "2026-05-27"
+
+
+def test_oai_explicit_datestamp_bounds_are_sent_at_day_granularity(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    page = parse_oai_pmh_list_records(
+        OAI_PAGE.replace("<resumptionToken>next-token</resumptionToken>", "")
+    )
+    fetcher = FakeOaiFetcher([page], [])
+
+    result = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            from_datestamp="2020-01-01T12:00:00Z",
+            until_datestamp="2020-01-02T23:59:59Z",
+            mode=OaiHarvestMode.INCREMENTAL,
+        )
+    )
+
+    assert result.status == "completed"
+    assert fetcher.seen[0]["from_datestamp"] == "2020-01-01"
+    assert fetcher.seen[0]["until_datestamp"] == "2020-01-02"
+    assert store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None) is None
 
 
 def test_oai_bounded_replay_does_not_advance_authoritative_watermark(
@@ -540,7 +612,7 @@ def test_oai_bounded_replay_does_not_advance_authoritative_watermark(
     )
 
     assert result.status == "completed"
-    assert result.current_watermark == "2020-01-02T00:00:00+00:00"
+    assert result.current_watermark == "2020-01-02"
     assert fetcher.seen[0]["from_datestamp"] == "2020-01-01"
     assert fetcher.seen[0]["until_datestamp"] == "2020-01-02"
     watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
