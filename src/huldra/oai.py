@@ -204,7 +204,9 @@ def _record_from_element(
     header = record.find(f"{{{OAI_NS}}}header")
     if header is None:
         raise ValueError("OAI record missing header")
-    identifier = _text(header.find(f"{{{OAI_NS}}}identifier")) or ""
+    identifier = _text(header.find(f"{{{OAI_NS}}}identifier"))
+    if identifier is None:
+        raise ValueError("OAI record missing identifier")
     datestamp = _parse_oai_datestamp(_text(header.find(f"{{{OAI_NS}}}datestamp")))
     set_specs = [
         value
@@ -216,7 +218,9 @@ def _record_from_element(
     raw_xml = ElementTree.tostring(record, encoding="unicode")
     arxiv_id = _arxiv_id_from_oai_identifier(identifier)
     paper = None
-    if not deleted and metadata is not None:
+    if not deleted:
+        if metadata is None:
+            raise ValueError(f"OAI record {identifier} missing metadata")
         paper = _paper_from_oai_metadata(
             metadata,
             metadata_prefix=metadata_prefix,

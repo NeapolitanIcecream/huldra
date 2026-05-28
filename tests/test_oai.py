@@ -128,6 +128,58 @@ OAI_MALFORMED_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
   </ListRecords>
 </OAI-PMH>"""
 
+OAI_MISSING_METADATA_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>oai:arXiv.org:2401.00005</identifier>
+        <datestamp>2026-05-27</datestamp>
+      </header>
+    </record>
+  </ListRecords>
+</OAI-PMH>"""
+
+OAI_MISSING_IDENTIFIER_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <ListRecords>
+    <record>
+      <header>
+        <datestamp>2026-05-27</datestamp>
+      </header>
+      <metadata>
+        <arXiv xmlns="http://arxiv.org/OAI/arXiv/">
+          <id>2401.00006</id>
+          <created>2024-01-01</created>
+          <title>Missing Identifier</title>
+        </arXiv>
+      </metadata>
+    </record>
+  </ListRecords>
+</OAI-PMH>"""
+
+OAI_BLANK_IDENTIFIER_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>   </identifier>
+        <datestamp>2026-05-27</datestamp>
+      </header>
+      <metadata>
+        <arXiv xmlns="http://arxiv.org/OAI/arXiv/">
+          <id>2401.00007</id>
+          <created>2024-01-01</created>
+          <title>Blank Identifier</title>
+        </arXiv>
+      </metadata>
+    </record>
+  </ListRecords>
+</OAI-PMH>"""
+
 
 @dataclass
 class FakeOaiFetcher:
@@ -208,6 +260,23 @@ def test_oai_parser_handles_arxiv_raw_record_versions_and_metadata() -> None:
     assert paper.updated_at.isoformat() == "2024-01-02T00:00:00+00:00"
 
 
+def test_oai_parser_rejects_non_deleted_record_without_metadata() -> None:
+    with pytest.raises(ValueError, match="missing metadata"):
+        parse_oai_pmh_list_records(OAI_MISSING_METADATA_RECORD_PAGE)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(OAI_MISSING_IDENTIFIER_RECORD_PAGE, id="missing"),
+        pytest.param(OAI_BLANK_IDENTIFIER_RECORD_PAGE, id="blank"),
+    ],
+)
+def test_oai_parser_rejects_record_missing_identifier(body: str) -> None:
+    with pytest.raises(ValueError, match="missing identifier"):
+        parse_oai_pmh_list_records(body)
+
+
 def test_oai_fetcher_503_retry_after_enters_rate_limit_flow(settings: HuldraSettings) -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -235,13 +304,22 @@ def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
     assert "malformed XML" in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    ("body", "expected_message"),
+    [
+        pytest.param(OAI_MALFORMED_RECORD_PAGE, "missing header", id="missing-header"),
+        pytest.param(OAI_MISSING_METADATA_RECORD_PAGE, "missing metadata", id="missing-metadata"),
+        pytest.param(OAI_MISSING_IDENTIFIER_RECORD_PAGE, "missing identifier", id="missing-identifier"),
+        pytest.param(OAI_BLANK_IDENTIFIER_RECORD_PAGE, "missing identifier", id="blank-identifier"),
+    ],
+)
 def test_oai_fetcher_malformed_record_raises_transient_fetch_error(
     settings: HuldraSettings,
+    body: str,
+    expected_message: str,
 ) -> None:
     client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, text=OAI_MALFORMED_RECORD_PAGE)
-        )
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body))
     )
 
     with pytest.raises(TransientFetchError) as exc:
@@ -249,6 +327,7 @@ def test_oai_fetcher_malformed_record_raises_transient_fetch_error(
 
     assert exc.value.status_code == 200
     assert "malformed OAI record" in str(exc.value)
+    assert expected_message in str(exc.value)
 
 
 def test_oai_harvest_503_retry_after_persists_shared_cooldown(
@@ -372,14 +451,22 @@ def test_oai_harvest_malformed_200_records_failure_and_releases_limiter(
     assert store.acquire_lease("upstream_fetch", "probe", 60)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(OAI_MALFORMED_RECORD_PAGE, id="missing-header"),
+        pytest.param(OAI_MISSING_METADATA_RECORD_PAGE, id="missing-metadata"),
+        pytest.param(OAI_MISSING_IDENTIFIER_RECORD_PAGE, id="missing-identifier"),
+        pytest.param(OAI_BLANK_IDENTIFIER_RECORD_PAGE, id="blank-identifier"),
+    ],
+)
 def test_oai_harvest_malformed_record_records_failure_and_releases_limiter(
     store: HuldraStore,
     settings: HuldraSettings,
+    body: str,
 ) -> None:
     client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, text=OAI_MALFORMED_RECORD_PAGE)
-        )
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body))
     )
     broker = HuldraBroker(
         store=store,
