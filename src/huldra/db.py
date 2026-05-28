@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from huldra.keys import normalize_arxiv_id, request_cache_key
+from huldra.keys import arxiv_id_family_base, normalize_arxiv_id, request_cache_key
 from huldra.migrations import apply_migrations
 from huldra.models import (
     ArxivPaper,
@@ -663,24 +663,29 @@ class HuldraStore:
                     ),
                 )
                 if record.deleted and record.arxiv_id:
+                    arxiv_ids = _paper_arxiv_ids_in_version_family(conn, record.arxiv_id)
+                    if not arxiv_ids:
+                        continue
+                    placeholders = ",".join("?" for _ in arxiv_ids)
                     conn.execute(
-                        """
+                        f"""
                         UPDATE papers
                         SET deleted=1,
                             oai_identifier=?,
                             oai_datestamp=COALESCE(?, oai_datestamp),
                             oai_set_specs_json=?,
                             last_seen_at=?
-                        WHERE arxiv_id=?
+                        WHERE arxiv_id IN ({placeholders})
                         """,
                         (
                             record.oai_identifier,
                             isoformat_or_none(record.datestamp),
                             json.dumps(record.set_specs, sort_keys=True, separators=(",", ":")),
                             timestamp,
-                            record.arxiv_id,
+                            *arxiv_ids,
                         ),
                     )
+
         return (len(records), len(papers), sum(1 for record in records if record.deleted))
 
     def get_latest_resumable_oai_harvest_token(self, request: OaiHarvestRequest) -> str | None:
@@ -1580,6 +1585,27 @@ def _same_oai_resume_scope(left: OaiHarvestRequest, right: OaiHarvestRequest) ->
 
 def _oai_set_key(set_spec: str | None) -> str:
     return set_spec or ""
+
+
+def _paper_arxiv_ids_in_version_family(conn: sqlite3.Connection, arxiv_id: str) -> tuple[str, ...]:
+    base_id = arxiv_id_family_base(arxiv_id)
+    rows = conn.execute(
+        """
+        SELECT arxiv_id FROM papers
+        WHERE arxiv_id = ?
+           OR arxiv_id LIKE ? ESCAPE '\\'
+        """,
+        (base_id, f"{_sqlite_like_escape(base_id)}v%"),
+    ).fetchall()
+    return tuple(
+        row["arxiv_id"]
+        for row in rows
+        if row["arxiv_id"] == base_id or arxiv_id_family_base(row["arxiv_id"]) == base_id
+    )
+
+
+def _sqlite_like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @dataclass(frozen=True, slots=True)

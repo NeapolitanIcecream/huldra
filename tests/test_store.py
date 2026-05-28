@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest, RateState, RequestStatus
+from huldra.models import ArxivRequest, OaiRecord, RateState, RequestStatus
 from huldra.time import utc_now
 from tests.conftest import make_paper
 
@@ -81,6 +81,39 @@ def test_upsert_papers_allows_oai_refresh_to_update_oai_provenance(
     assert paper.oai_identifier == "oai:arXiv.org:2401.00001"
     assert paper.oai_datestamp == refreshed_datestamp
     assert paper.oai_set_specs == []
+
+
+def test_upsert_oai_deleted_record_marks_versioned_legacy_paper(
+    store: HuldraStore,
+) -> None:
+    legacy_paper = make_paper("2401.00002v1")
+    unrelated_paper = make_paper("2401.000020v1")
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+
+    store.upsert_papers([legacy_paper, unrelated_paper])
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00002",
+                arxiv_id="2401.00002",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                deleted=True,
+            )
+        ]
+    )
+
+    deleted = store.get_paper("2401.00002v1")
+    unrelated = store.get_paper("2401.000020v1")
+
+    assert deleted is not None
+    assert deleted.deleted
+    assert deleted.oai_identifier == "oai:arXiv.org:2401.00002"
+    assert deleted.oai_datestamp == datestamp
+    assert deleted.oai_set_specs == ["cs:cs:AI"]
+    assert unrelated is not None
+    assert not unrelated.deleted
 
 
 def test_enqueue_dedupes_pending_cache_key(store: HuldraStore) -> None:
