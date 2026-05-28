@@ -200,10 +200,11 @@ class HuldraBroker:
         )
         harvest_id = self.store.create_oai_harvest_job(request)
         fetcher = self.oai_fetcher or OaiPmhFetcher(self.settings)
+        # OAI-PMH and legacy Atom calls share arXiv's upstream throttle.
+        # OAI-specific accounting stays in the harvest and page tables.
         limiter = HuldraRateLimiter(
             self.store,
             self.settings,
-            name="arxiv_oai_pmh",
             lease_name="upstream_fetch",
         )
         owner_token = f"oai:{harvest_id}"

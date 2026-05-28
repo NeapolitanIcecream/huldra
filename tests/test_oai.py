@@ -9,9 +9,11 @@ import pytest
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import NonRetryableFetchError, RateLimitedError, TransientFetchError
-from huldra.models import OaiHarvestMode, OaiHarvestRequest, OaiMetadataPrefix
+from huldra.fetcher import FetchResult, NonRetryableFetchError, RateLimitedError, TransientFetchError
+from huldra.models import ArxivRequest, OaiHarvestMode, OaiHarvestRequest, OaiMetadataPrefix
 from huldra.oai import OaiPmhFetcher, OaiPmhPage, parse_oai_pmh_list_records
+from huldra.worker import HuldraWorker
+from tests.conftest import make_paper
 
 OAI_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
 <OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
@@ -156,6 +158,19 @@ class FakeOaiFetcher:
         return response
 
 
+@dataclass
+class FakeLegacyFetcher:
+    responses: list[FetchResult | Exception]
+    calls: int = 0
+
+    def fetch(self, request: ArxivRequest) -> FetchResult:
+        self.calls += 1
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 def test_oai_parser_handles_arxiv_record_deleted_header_error_and_token() -> None:
     page = parse_oai_pmh_list_records(OAI_PAGE)
     deleted = parse_oai_pmh_list_records(OAI_DELETED_PAGE)
@@ -236,7 +251,7 @@ def test_oai_fetcher_malformed_record_raises_transient_fetch_error(
     assert "malformed OAI record" in str(exc.value)
 
 
-def test_oai_harvest_503_retry_after_persists_oai_cooldown(
+def test_oai_harvest_503_retry_after_persists_shared_cooldown(
     store: HuldraStore,
     settings: HuldraSettings,
 ) -> None:
@@ -255,12 +270,75 @@ def test_oai_harvest_503_retry_after_persists_oai_cooldown(
         OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
     )
 
-    rate_state = store.get_rate_state("arxiv_oai_pmh")
+    rate_state = store.get_rate_state()
     assert result.status == "rate_limited"
     assert result.error_message is not None
     assert "cooldown_until=" in result.error_message
     assert rate_state.cooldown_until is not None
     assert rate_state.last_status == 503
+
+
+def test_oai_harvest_delay_is_shared_with_legacy_worker(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    page = parse_oai_pmh_list_records(
+        OAI_PAGE.replace("<resumptionToken>next-token</resumptionToken>", "")
+    )
+    harvest = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=FakeOaiFetcher([page], []),
+    ).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+    store.enqueue_request(ArxivRequest(client_id="legacy", search_query="cat:cs.AI"))
+    sleeps: list[float] = []
+    fetcher = FakeLegacyFetcher(
+        [FetchResult([make_paper("2401.00005v1")], total_results=1)]
+    )
+
+    worker = HuldraWorker(store, settings, fetcher=fetcher, sleep=sleeps.append)
+    worker_result = worker.run_once()
+
+    assert harvest.status == "completed"
+    assert worker_result.status == "completed"
+    assert fetcher.calls == 1
+    assert sleeps
+    assert sleeps[0] > 0
+
+
+def test_oai_retry_after_cooldown_is_shared_with_legacy_worker(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    harvest = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=FakeOaiFetcher([RateLimitedError(30)], []),
+    ).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+    shared_state = store.get_rate_state()
+    store.enqueue_request(ArxivRequest(client_id="legacy", search_query="cat:cs.AI"))
+    fetcher = FakeLegacyFetcher(
+        [FetchResult([make_paper("2401.00006v1")], total_results=1)]
+    )
+
+    worker_result = HuldraWorker(
+        store,
+        settings,
+        fetcher=fetcher,
+        sleep=lambda _: None,
+    ).run_once()
+
+    assert harvest.status == "rate_limited"
+    assert shared_state.cooldown_until is not None
+    assert store.status_summary().cooldown_active
+    assert worker_result.status == "cooling_down"
+    assert worker_result.error_category == "cooldown"
+    assert worker_result.cooldown_until == shared_state.cooldown_until
+    assert fetcher.calls == 0
 
 
 def test_oai_harvest_malformed_200_records_failure_and_releases_limiter(
