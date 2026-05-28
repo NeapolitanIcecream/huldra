@@ -28,6 +28,9 @@ class HuldraSettings(BaseSettings):
     maturity_lag_days: int = 1
     user_agent: str = f"Huldra/{__version__} (local arxiv metadata broker; contact: unset)"
     arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    arxiv_oai_pmh_url: str = "https://oaipmh.arxiv.org/oai"
+    legacy_search_window_result_cap: int = 10000
+    oai_overlap_seconds: int = 0
 
     model_config = SettingsConfigDict(
         env_prefix="HULDRA_",
@@ -54,4 +57,18 @@ class HuldraSettings(BaseSettings):
     def _positive_integer(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("value must be positive")
+        return value
+
+    @field_validator("legacy_search_window_result_cap")
+    @classmethod
+    def _positive_window_cap(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("legacy_search_window_result_cap must be positive")
+        return value
+
+    @field_validator("oai_overlap_seconds")
+    @classmethod
+    def _non_negative_overlap(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("oai_overlap_seconds cannot be negative")
         return value

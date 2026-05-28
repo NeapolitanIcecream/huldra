@@ -33,14 +33,15 @@ The MVP is metadata-only. It stores descriptive metadata that arXiv allows to be
 retrieved, stored, transformed, and shared. It does not cache or serve PDFs,
 source files, paper HTML, or other e-print content.
 
-The implemented backend family is `legacy_search`. It supports arXiv API
+The default request backend family is `legacy_search`. It supports arXiv API
 parameters such as `search_query`, `id_list`, `start`, `max_results`, `sortBy`,
-and `sortOrder`. `max_results` is capped at 2000 for one upstream slice. Large
-or full metadata harvesting belongs in a future OAI-PMH backend, not in search
-API brute-force pagination.
+and `sortOrder`. `max_results` is capped at 2000 for one upstream slice.
+Maintenance callers can opt into `complete_window` mode to page a bounded
+legacy-search window, but the default remains explicit slice caching.
 
-OAI-PMH is reserved as a future backend for full metadata mirrors and
-incremental sync. It is not implemented in this MVP.
+The mirror backend is OAI-PMH. It is separate from `ArxivRequest` and is used
+for full metadata mirrors, category-scoped harvests, deleted headers, raw OAI
+records, and datestamp-based incremental watermarks.
 
 ## Single-Machine Boundary
 

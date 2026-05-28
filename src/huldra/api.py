@@ -18,6 +18,8 @@ from huldra.models import (
     HuldraBackfillRequest,
     HuldraMaintenanceResult,
     HuldraSyncRequest,
+    OaiHarvestRequest,
+    OaiHarvestResult,
 )
 
 
@@ -61,6 +63,7 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
             request.requests,
             wait=request.wait,
             wait_timeout_seconds=request.wait_timeout_seconds,
+            mode=request.mode,
         )
 
     @app.post("/v1/backfill", response_model=HuldraMaintenanceResult)
@@ -72,8 +75,13 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
             max_results=request.max_results,
             wait=request.wait,
             wait_timeout_seconds=request.wait_timeout_seconds,
+            mode=request.mode,
             client_id=request.client_id,
         )
+
+    @app.post("/v1/harvest/oai", response_model=OaiHarvestResult)
+    def harvest_oai(request: OaiHarvestRequest) -> OaiHarvestResult:
+        return broker.harvest_oai(request)
 
     @app.get("/v1/papers/{arxiv_id:path}", response_model=ArxivPaper | None)
     def get_paper(arxiv_id: str) -> ArxivPaper | None:

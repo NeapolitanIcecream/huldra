@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
@@ -30,6 +30,16 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             journal_ref TEXT,
             doi TEXT,
             raw_atom_json TEXT NOT NULL,
+            authors_detail_json TEXT NOT NULL DEFAULT '[]',
+            license TEXT,
+            oai_identifier TEXT,
+            oai_datestamp TEXT,
+            oai_set_specs_json TEXT NOT NULL DEFAULT '[]',
+            links_json TEXT NOT NULL DEFAULT '[]',
+            versions_json TEXT NOT NULL DEFAULT '[]',
+            withdrawn INTEGER NOT NULL DEFAULT 0,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            raw_metadata_json TEXT NOT NULL DEFAULT '{}',
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL
         );
@@ -46,6 +56,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             upstream_requests_total INTEGER NOT NULL DEFAULT 0,
             result_count INTEGER NOT NULL DEFAULT 0,
             total_results INTEGER,
+            coverage_status TEXT NOT NULL DEFAULT 'unknown',
             error_category TEXT,
             error_message TEXT
         );
@@ -125,10 +136,113 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS sync_jobs (
+            sync_job_id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            coverage_status TEXT NOT NULL DEFAULT 'unknown',
+            result_count INTEGER NOT NULL DEFAULT 0,
+            total_results INTEGER,
+            pages_total INTEGER NOT NULL DEFAULT 0,
+            pages_completed_total INTEGER NOT NULL DEFAULT 0,
+            error_category TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_job_pages (
+            sync_job_id TEXT NOT NULL REFERENCES sync_jobs(sync_job_id) ON DELETE CASCADE,
+            cache_key TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            start INTEGER NOT NULL,
+            max_results INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            total_results INTEGER,
+            attempt_diagnostics_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (sync_job_id, cache_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS oai_harvest_jobs (
+            harvest_id TEXT PRIMARY KEY,
+            request_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            metadata_prefix TEXT NOT NULL,
+            set_spec TEXT,
+            mode TEXT NOT NULL,
+            records_processed INTEGER NOT NULL DEFAULT 0,
+            papers_upserted INTEGER NOT NULL DEFAULT 0,
+            deleted_records INTEGER NOT NULL DEFAULT 0,
+            pages_total INTEGER NOT NULL DEFAULT 0,
+            current_watermark TEXT,
+            resumption_token TEXT,
+            error_category TEXT,
+            error_message TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS oai_watermarks (
+            metadata_prefix TEXT NOT NULL,
+            set_spec TEXT NOT NULL DEFAULT '',
+            last_response_date TEXT,
+            last_datestamp_seen TEXT,
+            last_successful_harvest_id TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (metadata_prefix, set_spec)
+        );
+
+        CREATE TABLE IF NOT EXISTS oai_pages (
+            harvest_id TEXT NOT NULL REFERENCES oai_harvest_jobs(harvest_id) ON DELETE CASCADE,
+            page_index INTEGER NOT NULL,
+            request_params_json TEXT NOT NULL,
+            resumption_token_hash TEXT,
+            status TEXT NOT NULL,
+            response_date TEXT,
+            records_count INTEGER NOT NULL DEFAULT 0,
+            error_category TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (harvest_id, page_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS oai_records (
+            oai_identifier TEXT NOT NULL,
+            metadata_prefix TEXT NOT NULL,
+            arxiv_id TEXT,
+            datestamp TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            set_specs_json TEXT NOT NULL DEFAULT '[]',
+            raw_xml TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (oai_identifier, metadata_prefix)
+        );
         """
     )
     _ensure_rate_state_upstream_429_total(conn)
     _ensure_queue_items_work_kind(conn)
+    _ensure_column(conn, "cache_entries", "coverage_status", "TEXT NOT NULL DEFAULT 'unknown'")
+    _backfill_legacy_cache_coverage_status(conn)
+    for column, definition in {
+        "authors_detail_json": "TEXT NOT NULL DEFAULT '[]'",
+        "license": "TEXT",
+        "oai_identifier": "TEXT",
+        "oai_datestamp": "TEXT",
+        "oai_set_specs_json": "TEXT NOT NULL DEFAULT '[]'",
+        "links_json": "TEXT NOT NULL DEFAULT '[]'",
+        "versions_json": "TEXT NOT NULL DEFAULT '[]'",
+        "withdrawn": "INTEGER NOT NULL DEFAULT 0",
+        "deleted": "INTEGER NOT NULL DEFAULT 0",
+        "raw_metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+    }.items():
+        _ensure_column(conn, "papers", column, definition)
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))"
     )
@@ -164,4 +278,28 @@ def _ensure_queue_items_work_kind(conn: sqlite3.Connection) -> None:
         return
     conn.execute(
         "ALTER TABLE queue_items ADD COLUMN work_kind TEXT NOT NULL DEFAULT 'fetch_missing'"
+    )
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column in columns:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _backfill_legacy_cache_coverage_status(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE cache_entries
+        SET coverage_status = 'slice'
+        WHERE api_family = 'legacy_search'
+          AND status = 'completed'
+          AND coverage_status = 'unknown'
+        """
     )

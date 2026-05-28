@@ -14,7 +14,7 @@ from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import normalize_arxiv_id
-from huldra.models import ArxivRequest, CachePolicy
+from huldra.models import ArxivRequest, CachePolicy, LegacySyncMode, OaiHarvestMode, OaiHarvestRequest
 from huldra.planner import build_submitted_date_windows
 from huldra.time import parse_datetime, utc_now
 from huldra.worker import HuldraWorker, WorkerPassResult
@@ -25,7 +25,9 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
 )
 store_app = typer.Typer(help="Manage the Huldra SQLite store.", no_args_is_help=True)
+harvest_app = typer.Typer(help="Run metadata harvest jobs.", no_args_is_help=True)
 app.add_typer(store_app, name="store")
+app.add_typer(harvest_app, name="harvest")
 
 _IMMEDIATE_WORKER_STATUSES = frozenset({"cache_hit", "completed", "failed"})
 
@@ -46,6 +48,27 @@ def _parse_date(value: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise typer.BadParameter("expected YYYY-MM-DD") from exc
+
+
+def _parse_sync_mode(value: str) -> LegacySyncMode:
+    normalized = value.strip().replace("-", "_")
+    try:
+        return LegacySyncMode(normalized)
+    except ValueError as exc:
+        raise typer.BadParameter("expected slice or complete-window") from exc
+
+
+def _validate_sync_mode_wait(mode: LegacySyncMode, wait: bool) -> None:
+    if mode == LegacySyncMode.COMPLETE_WINDOW and not wait:
+        raise typer.BadParameter("--mode complete-window requires --wait")
+
+
+def _parse_oai_mode(value: str) -> OaiHarvestMode:
+    normalized = value.strip().replace("-", "_")
+    try:
+        return OaiHarvestMode(normalized)
+    except ValueError as exc:
+        raise typer.BadParameter("expected initial or incremental") from exc
 
 
 def _worker_sleep_seconds(result: WorkerPassResult, settings: HuldraSettings) -> float:
@@ -210,6 +233,10 @@ def sync(
         typer.Option("--date", help="Submitted-date UTC day to sync."),
     ] = None,
     max_results: Annotated[int, typer.Option("--max-results", min=1, max=2000)] = 50,
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="slice or complete-window."),
+    ] = "slice",
     client_id: Annotated[str, typer.Option("--client-id", help="Client identifier.")] = "cli-sync",
     wait: Annotated[bool, typer.Option("--wait", help="Drain this request set inline.")] = False,
     wait_timeout_seconds: Annotated[
@@ -230,10 +257,13 @@ def sync(
         client_id=client_id,
     )
     broker = HuldraBroker(settings=_settings(db))
+    parsed_mode = _parse_sync_mode(mode)
+    _validate_sync_mode_wait(parsed_mode, wait)
     payload = broker.sync_windows(
         requests,
         wait=wait,
         wait_timeout_seconds=wait_timeout_seconds,
+        mode=parsed_mode,
     ).model_dump(mode="json")
     if json_output:
         _print_json(payload)
@@ -257,6 +287,10 @@ def backfill(
         typer.Option("--end-date", help="Last UTC date, inclusive."),
     ] = None,
     max_results: Annotated[int, typer.Option("--max-results", min=1, max=2000)] = 50,
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="slice or complete-window."),
+    ] = "slice",
     client_id: Annotated[str, typer.Option("--client-id", help="Client identifier.")] = "huldra-backfill",
     wait: Annotated[bool, typer.Option("--wait", help="Drain this request set inline.")] = False,
     wait_timeout_seconds: Annotated[
@@ -270,6 +304,8 @@ def backfill(
     parsed_start = _parse_date(start_date)
     resolved_end = _parse_date(end_date) if end_date is not None else parsed_start
     broker = HuldraBroker(settings=_settings(db))
+    parsed_mode = _parse_sync_mode(mode)
+    _validate_sync_mode_wait(parsed_mode, wait)
     payload = broker.backfill_windows(
         search_queries=search_query or [],
         start_date=parsed_start,
@@ -277,7 +313,53 @@ def backfill(
         max_results=max_results,
         wait=wait,
         wait_timeout_seconds=wait_timeout_seconds,
+        mode=parsed_mode,
         client_id=client_id,
+    ).model_dump(mode="json")
+    if json_output:
+        _print_json(payload)
+    else:
+        typer.echo(payload)
+
+
+@harvest_app.command("oai")
+def harvest_oai(
+    db: Annotated[Path | None, typer.Option("--db", help="SQLite database path.")] = None,
+    metadata_prefix: Annotated[
+        str,
+        typer.Option("--metadata-prefix", help="OAI metadata prefix: arXiv or arXivRaw."),
+    ] = "arXiv",
+    set_spec: Annotated[
+        str | None,
+        typer.Option("--set", help="Optional OAI setSpec, for example cs:cs:AI."),
+    ] = None,
+    from_datestamp: Annotated[
+        str | None,
+        typer.Option("--from", help="Optional OAI from datestamp."),
+    ] = None,
+    until_datestamp: Annotated[
+        str | None,
+        typer.Option("--until", help="Optional OAI until datestamp."),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="initial or incremental."),
+    ] = "incremental",
+    client_id: Annotated[str, typer.Option("--client-id", help="Client identifier.")] = "cli-harvest",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    if metadata_prefix not in {"arXiv", "arXivRaw"}:
+        raise typer.BadParameter("--metadata-prefix must be arXiv or arXivRaw")
+    broker = HuldraBroker(settings=_settings(db))
+    payload = broker.harvest_oai(
+        OaiHarvestRequest(
+            client_id=client_id,
+            metadata_prefix=metadata_prefix,  # type: ignore[arg-type]
+            set_spec=set_spec,
+            from_datestamp=from_datestamp,
+            until_datestamp=until_datestamp,
+            mode=_parse_oai_mode(mode),
+        )
     ).model_dump(mode="json")
     if json_output:
         _print_json(payload)

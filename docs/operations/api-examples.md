@@ -85,6 +85,7 @@ curl -X POST http://127.0.0.1:8765/v1/sync \
   -d '{
     "wait": true,
     "wait_timeout_seconds": 30,
+    "mode": "slice",
     "requests": [
       {
         "client_id": "recoleta:example",
@@ -100,7 +101,8 @@ curl -X POST http://127.0.0.1:8765/v1/sync \
 ```
 
 `wait=true` drains only the requested cache keys inline. Other queued work may
-remain queued.
+remain queued. Use `"mode": "complete_window"` to fetch every contiguous legacy
+search page for the window up to the configured cap.
 
 ## Backfill Daily Windows
 
@@ -119,8 +121,25 @@ curl -X POST http://127.0.0.1:8765/v1/backfill \
 
 The maintenance response reports counters for this call, including
 `requested_total`, `queued_total`, `cache_hit_total`, `cache_miss_total`,
-`completed_windows_total`, `upstream_requests_total`, `upstream_429_total`, and
-per-window `raw_cache_status` and `serving_status`.
+`completed_windows_total`, `completed_slices_total`, `upstream_requests_total`,
+`upstream_429_total`, and per-window `raw_cache_status`, `serving_status`,
+`coverage_status`, `pages_total`, and `pages_completed_total`.
+
+## Harvest OAI-PMH
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/harvest/oai \
+  -H 'content-type: application/json' \
+  -d '{
+    "client_id": "mirror:cs-ai",
+    "metadata_prefix": "arXiv",
+    "set_spec": "cs:cs.AI",
+    "mode": "incremental"
+  }'
+```
+
+OAI harvest responses include `records_processed`, `papers_upserted`,
+`deleted_records`, `pages_total`, and `current_watermark`.
 
 ## Read A Paper
 

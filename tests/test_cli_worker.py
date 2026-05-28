@@ -114,3 +114,23 @@ def test_sync_and_backfill_cli_emit_json_summaries(tmp_path: Path) -> None:
     assert json.loads(sync.output)["requested_total"] == 1
     assert backfill.exit_code == 0
     assert json.loads(backfill.output)["requested_total"] == 2
+
+
+def test_complete_window_cli_requires_wait(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sync",
+            "--db",
+            str(tmp_path / "huldra.db"),
+            "--search-query",
+            "cat:cs.AI",
+            "--date",
+            "2026-01-01",
+            "--mode",
+            "complete-window",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "requires --wait" in result.output

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import feedparser
 
@@ -11,18 +12,35 @@ from huldra.models import ArxivPaper
 
 
 @dataclass(frozen=True, slots=True)
+class ArxivAtomError:
+    title: str
+    message: str | None
+    entry_id: str | None
+    alternate_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedArxivFeed:
     papers: list[ArxivPaper]
     total_results: int | None
+    errors: list[ArxivAtomError]
 
 
 def parse_arxiv_atom(text: str | bytes) -> ParsedArxivFeed:
     parsed = feedparser.parse(text)
-    papers = [_paper_from_entry(entry) for entry in parsed.entries]
     feed = cast(Any, parsed.feed)
+    errors = _error_feed_entries(parsed.entries)
+    if errors:
+        return ParsedArxivFeed(
+            papers=[],
+            total_results=_coerce_int(feed.get("opensearch_totalresults")),
+            errors=errors,
+        )
+    papers = [_paper_from_entry(entry) for entry in parsed.entries]
     return ParsedArxivFeed(
         papers=papers,
         total_results=_coerce_int(feed.get("opensearch_totalresults")),
+        errors=[],
     )
 
 
@@ -64,6 +82,49 @@ def _paper_from_entry(entry: Any) -> ArxivPaper:
 
 def _normalize_space(value: str) -> str:
     return " ".join(value.split())
+
+
+def _error_feed_entries(entries: list[Any]) -> list[ArxivAtomError]:
+    if len(entries) != 1:
+        return []
+    entry = entries[0]
+    title = _normalize_space(str(entry.get("title") or ""))
+    if title.lower() != "error":
+        return []
+    raw_id = str(entry.get("id") or "").strip()
+    alternate_url = _alternate_link(entry)
+    if _is_paper_abs_url(raw_id):
+        return []
+    if not (_is_api_error_url(raw_id) or _is_api_error_url(alternate_url)):
+        return []
+    return [
+        ArxivAtomError(
+            title=title,
+            message=_entry_text(entry, "summary") or _entry_text(entry, "subtitle"),
+            entry_id=raw_id or None,
+            alternate_url=alternate_url,
+        )
+    ]
+
+
+def _is_paper_abs_url(value: str | None) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(str(value).strip())
+    return parsed.scheme in {"http", "https"} and parsed.netloc.endswith("arxiv.org") and (
+        parsed.path == "/abs" or parsed.path.startswith("/abs/")
+    )
+
+
+def _is_api_error_url(value: str | None) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(str(value).strip())
+    path = parsed.path.rstrip("/")
+    if path == "/api/errors" or path.startswith("/api/errors/"):
+        return True
+    fragment = parsed.fragment.strip("/")
+    return fragment == "api/errors" or fragment.startswith("api/errors/")
 
 
 def _entry_text(entry: Any, key: str) -> str | None:

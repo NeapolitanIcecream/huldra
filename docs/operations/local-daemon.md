@@ -27,7 +27,8 @@ can tell when arXiv returned HTTP 429 and the worker is waiting.
 ## Sync And Backfill Jobs
 
 Use `sync` for an explicit submitted-date day. `--wait` drains that request set
-through the same queue, limiter, and fetcher used by the worker.
+through the same queue, limiter, and fetcher used by the worker. The default
+mode completes one legacy search slice.
 
 ```bash
 uv run huldra sync \
@@ -35,6 +36,20 @@ uv run huldra sync \
   --search-query 'cat:cs.AI' \
   --date 2026-05-20 \
   --max-results 60 \
+  --wait \
+  --json
+```
+
+Use `--mode complete-window` when the caller needs every page in a bounded
+legacy search window:
+
+```bash
+uv run huldra sync \
+  --db ~/.local/share/huldra/huldra.db \
+  --search-query 'cat:cs.AI' \
+  --date 2026-05-20 \
+  --max-results 60 \
+  --mode complete-window \
   --wait \
   --json
 ```
@@ -55,9 +70,29 @@ The JSON summary reports only work attributed to that command. For example,
 `upstream_requests_total` increments only when the command's inline wait path
 executes the fetch. If another worker completes a joined queue item, the window
 can still count as completed without adding an upstream request to that command.
+For complete-window jobs, inspect `coverage_status`, `pages_total`, and
+`pages_completed_total`; `overflow` means the window exceeded the configured
+legacy search cap and was not treated as complete.
 
 You can run `sync --wait` without a separate worker for short pre-syncs. Keep a
 supervised worker running for normal background draining and stale refresh work.
+
+## OAI-PMH Harvest Jobs
+
+Use OAI-PMH for full mirrors, category-scoped mirrors, and datestamp-based
+incremental sync:
+
+```bash
+uv run huldra harvest oai \
+  --db ~/.local/share/huldra/huldra.db \
+  --metadata-prefix arXiv \
+  --set cs:cs.AI \
+  --mode incremental \
+  --json
+```
+
+Harvests store page state and advance the `(metadata_prefix, set_spec)`
+watermark only after every resumption-token page succeeds.
 
 ## systemd User Service
 

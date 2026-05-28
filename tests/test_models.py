@@ -5,7 +5,13 @@ from datetime import UTC, datetime
 import pytest
 
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest, ArxivResult, HuldraMaintenanceResult
+from huldra.models import (
+    ArxivRequest,
+    ArxivResult,
+    HuldraMaintenanceResult,
+    HuldraSyncRequest,
+    LegacySyncMode,
+)
 
 
 def test_request_requires_client_and_query_or_ids() -> None:
@@ -18,6 +24,22 @@ def test_request_requires_client_and_query_or_ids() -> None:
 def test_request_limits_single_slice_to_2000_results() -> None:
     with pytest.raises(ValueError):
         ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=2001)
+
+
+def test_legacy_request_rejects_oai_api_family() -> None:
+    with pytest.raises(ValueError, match="OaiHarvestRequest"):
+        ArxivRequest(client_id="demo", search_query="cat:cs.AI", api_family="oai_pmh")
+
+
+def test_complete_window_sync_model_requires_wait_true() -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
+
+    with pytest.raises(ValueError, match="requires wait=True"):
+        HuldraSyncRequest(
+            requests=[request],
+            mode=LegacySyncMode.COMPLETE_WINDOW,
+            wait=False,
+        )
 
 
 def test_submitted_window_requires_ordered_utc_pair() -> None:

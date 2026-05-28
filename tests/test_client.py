@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +11,7 @@ from huldra.client import HuldraClient, HuldraHTTPError
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest
+from huldra.models import ArxivRequest, LegacySyncMode, OaiHarvestRequest
 from tests.conftest import make_paper
 
 
@@ -145,3 +147,61 @@ def test_client_sync_windows_uses_http_api() -> None:
     assert result.requested_total == 1
     assert result.requests[0].raw_cache_status == "queued"
     assert requests[0].url.path == "/v1/sync"
+
+
+def test_client_sync_windows_surfaces_complete_window_wait_validation(
+    settings: HuldraSettings,
+) -> None:
+    client = HuldraClient(client=TestClient(create_app(settings)))
+
+    with pytest.raises(HuldraHTTPError) as exc_info:
+        client.sync_windows(
+            [ArxivRequest(client_id="demo", search_query="cat:cs.AI")],
+            mode=LegacySyncMode.COMPLETE_WINDOW,
+            wait=False,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "requires wait=True" in str(exc_info.value)
+
+
+def test_client_harvest_oai_uses_http_api() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/harvest/oai":
+            return httpx.Response(
+                200,
+                json={
+                    "harvest_id": "harvest-1",
+                    "status": "completed",
+                    "metadata_prefix": "arXiv",
+                    "set_spec": "cs:cs.AI",
+                    "mode": "incremental",
+                    "records_processed": 0,
+                    "papers_upserted": 0,
+                    "deleted_records": 0,
+                    "pages_total": 1,
+                },
+            )
+        return httpx.Response(404)
+
+    client = HuldraClient(
+        client=httpx.Client(
+            base_url="http://testserver",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    result = client.harvest_oai(
+        OaiHarvestRequest(client_id="demo", metadata_prefix="arXiv", set_spec="cs:cs.AI")
+    )
+
+    assert result.status == "completed"
+    assert result.pages_total == 1
+    assert requests[0].url.path == "/v1/harvest/oai"
+    payload = json.loads(requests[0].content)
+    assert payload["client_id"] == "demo"
+    assert payload["metadata_prefix"] == "arXiv"
+    assert payload["set_spec"] == "cs:cs.AI"

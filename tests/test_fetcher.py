@@ -9,6 +9,7 @@ import pytest
 from huldra.config import HuldraSettings
 from huldra.fetcher import (
     ArxivApiFetcher,
+    NonRetryableFetchError,
     RateLimitedError,
     TransientFetchError,
     _parse_retry_after_seconds,
@@ -27,6 +28,17 @@ FEED = """<?xml version="1.0" encoding="UTF-8"?>
   </entry>
 </feed>"""
 
+ERROR_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/api/errors</id>
+    <link href="http://arxiv.org/api/errors" rel="alternate"/>
+    <title>Error</title>
+    <summary>incorrect id format</summary>
+    <author><name>arXiv api core</name></author>
+  </entry>
+</feed>"""
+
 
 def test_fetcher_turns_200_atom_into_papers(settings: HuldraSettings) -> None:
     calls: list[httpx.Request] = []
@@ -42,6 +54,17 @@ def test_fetcher_turns_200_atom_into_papers(settings: HuldraSettings) -> None:
     assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
     assert len(calls) == 1
     assert calls[0].headers["user-agent"] == settings.user_agent
+
+
+def test_fetcher_rejects_200_atom_error_feed(settings: HuldraSettings) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text=ERROR_FEED))
+    )
+
+    with pytest.raises(NonRetryableFetchError, match="error feed"):
+        ArxivApiFetcher(settings, client=client).fetch(
+            ArxivRequest(client_id="demo", id_list=("not an id",))
+        )
 
 
 def test_fetcher_429_integer_retry_after(settings: HuldraSettings) -> None:

@@ -14,6 +14,9 @@ from huldra.models import (
     ArxivResult,
     BrokerStatus,
     HuldraMaintenanceResult,
+    LegacySyncMode,
+    OaiHarvestRequest,
+    OaiHarvestResult,
 )
 
 
@@ -108,6 +111,7 @@ class HuldraClient:
         *,
         wait: bool = False,
         wait_timeout_seconds: float | None = None,
+        mode: LegacySyncMode = LegacySyncMode.SLICE,
     ) -> HuldraMaintenanceResult:
         response = self._client.post(
             "/v1/sync",
@@ -115,6 +119,7 @@ class HuldraClient:
                 "requests": [request.model_dump(mode="json") for request in requests],
                 "wait": wait,
                 "wait_timeout_seconds": wait_timeout_seconds,
+                "mode": mode,
             },
         )
         return HuldraMaintenanceResult.model_validate(self._json(response))
@@ -128,6 +133,7 @@ class HuldraClient:
         max_results: int,
         wait: bool = False,
         wait_timeout_seconds: float | None = None,
+        mode: LegacySyncMode = LegacySyncMode.SLICE,
         client_id: str = "huldra-backfill",
     ) -> HuldraMaintenanceResult:
         response = self._client.post(
@@ -139,10 +145,15 @@ class HuldraClient:
                 "max_results": max_results,
                 "wait": wait,
                 "wait_timeout_seconds": wait_timeout_seconds,
+                "mode": mode,
                 "client_id": client_id,
             },
         )
         return HuldraMaintenanceResult.model_validate(self._json(response))
+
+    def harvest_oai(self, request: OaiHarvestRequest) -> OaiHarvestResult:
+        response = self._client.post("/v1/harvest/oai", json=request.model_dump(mode="json"))
+        return OaiHarvestResult.model_validate(self._json(response))
 
     def get_paper(self, arxiv_id: str) -> ArxivPaper | None:
         encoded = quote(arxiv_id, safe="")

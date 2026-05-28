@@ -9,6 +9,7 @@ from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, RateState
+from huldra.oai import OaiPmhPage
 from huldra.time import utc_now
 from tests.conftest import make_paper
 
@@ -120,6 +121,50 @@ def test_api_sync_endpoint_returns_maintenance_summary(settings: HuldraSettings)
     assert payload["requests"][0]["raw_cache_status"] == "queued"
 
 
+def test_api_sync_rejects_complete_window_without_wait(settings: HuldraSettings) -> None:
+    response = TestClient(create_app(settings)).post(
+        "/v1/sync",
+        json={
+            "requests": [{"client_id": "api", "search_query": "cat:cs.AI"}],
+            "mode": "complete_window",
+            "wait": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "requires wait=True" in response.text
+
+
+def test_api_legacy_request_surfaces_reject_oai_family(settings: HuldraSettings) -> None:
+    client = TestClient(create_app(settings))
+
+    request_response = client.post(
+        "/v1/requests",
+        json={
+            "client_id": "api",
+            "search_query": "cat:cs.AI",
+            "api_family": "oai_pmh",
+        },
+    )
+    sync_response = client.post(
+        "/v1/sync",
+        json={
+            "requests": [
+                {
+                    "client_id": "api",
+                    "search_query": "cat:cs.AI",
+                    "api_family": "oai_pmh",
+                }
+            ]
+        },
+    )
+
+    assert request_response.status_code == 422
+    assert sync_response.status_code == 422
+    assert "OaiHarvestRequest" in request_response.text
+    assert "OaiHarvestRequest" in sync_response.text
+
+
 def test_api_backfill_endpoint_plans_windows(settings: HuldraSettings) -> None:
     client = TestClient(create_app(settings))
 
@@ -138,3 +183,35 @@ def test_api_backfill_endpoint_plans_windows(settings: HuldraSettings) -> None:
     payload = response.json()
     assert payload["requested_total"] == 2
     assert payload["queued_total"] == 2
+
+
+def test_api_harvest_oai_endpoint_runs_harvest(
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    class FakeOaiPmhFetcher:
+        def __init__(self, settings: HuldraSettings) -> None:
+            self.settings = settings
+
+        def list_records(self, **kwargs: object) -> OaiPmhPage:
+            return OaiPmhPage(
+                records=[],
+                response_date="2026-05-28T00:00:00Z",
+                resumption_token=None,
+                errors=[],
+                request_params={"verb": "ListRecords", "metadataPrefix": "arXiv"},
+            )
+
+    monkeypatch.setattr("huldra.broker.OaiPmhFetcher", FakeOaiPmhFetcher)
+    client = TestClient(create_app(settings))
+
+    response = client.post(
+        "/v1/harvest/oai",
+        json={"client_id": "api", "metadata_prefix": "arXiv", "mode": "initial"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["pages_total"] == 1
+    assert payload["current_watermark"] == "2026-05-28T00:00:00Z"
