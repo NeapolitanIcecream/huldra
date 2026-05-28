@@ -180,6 +180,38 @@ OAI_BLANK_IDENTIFIER_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
   </ListRecords>
 </OAI-PMH>"""
 
+OAI_MISSING_DATESTAMP_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>oai:arXiv.org:2401.00008</identifier>
+      </header>
+      <metadata>
+        <arXiv xmlns="http://arxiv.org/OAI/arXiv/">
+          <id>2401.00008</id>
+          <created>2024-01-01</created>
+          <title>Missing Datestamp</title>
+        </arXiv>
+      </metadata>
+    </record>
+  </ListRecords>
+</OAI-PMH>"""
+
+OAI_INVALID_DATESTAMP_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <ListRecords>
+    <record>
+      <header status="deleted">
+        <identifier>oai:arXiv.org:2401.00009</identifier>
+        <datestamp>not-a-date</datestamp>
+      </header>
+    </record>
+  </ListRecords>
+</OAI-PMH>"""
+
 
 @dataclass
 class FakeOaiFetcher:
@@ -277,6 +309,21 @@ def test_oai_parser_rejects_record_missing_identifier(body: str) -> None:
         parse_oai_pmh_list_records(body)
 
 
+@pytest.mark.parametrize(
+    ("body", "expected_message"),
+    [
+        pytest.param(OAI_MISSING_DATESTAMP_RECORD_PAGE, "missing datestamp", id="missing"),
+        pytest.param(OAI_INVALID_DATESTAMP_RECORD_PAGE, "invalid datestamp", id="invalid"),
+    ],
+)
+def test_oai_parser_rejects_record_missing_or_invalid_datestamp(
+    body: str,
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_message):
+        parse_oai_pmh_list_records(body)
+
+
 def test_oai_fetcher_503_retry_after_enters_rate_limit_flow(settings: HuldraSettings) -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -311,6 +358,8 @@ def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
         pytest.param(OAI_MISSING_METADATA_RECORD_PAGE, "missing metadata", id="missing-metadata"),
         pytest.param(OAI_MISSING_IDENTIFIER_RECORD_PAGE, "missing identifier", id="missing-identifier"),
         pytest.param(OAI_BLANK_IDENTIFIER_RECORD_PAGE, "missing identifier", id="blank-identifier"),
+        pytest.param(OAI_MISSING_DATESTAMP_RECORD_PAGE, "missing datestamp", id="missing-datestamp"),
+        pytest.param(OAI_INVALID_DATESTAMP_RECORD_PAGE, "invalid datestamp", id="invalid-datestamp"),
     ],
 )
 def test_oai_fetcher_malformed_record_raises_transient_fetch_error(
@@ -458,6 +507,8 @@ def test_oai_harvest_malformed_200_records_failure_and_releases_limiter(
         pytest.param(OAI_MISSING_METADATA_RECORD_PAGE, id="missing-metadata"),
         pytest.param(OAI_MISSING_IDENTIFIER_RECORD_PAGE, id="missing-identifier"),
         pytest.param(OAI_BLANK_IDENTIFIER_RECORD_PAGE, id="blank-identifier"),
+        pytest.param(OAI_MISSING_DATESTAMP_RECORD_PAGE, id="missing-datestamp"),
+        pytest.param(OAI_INVALID_DATESTAMP_RECORD_PAGE, id="invalid-datestamp"),
     ],
 )
 def test_oai_harvest_malformed_record_records_failure_and_releases_limiter(

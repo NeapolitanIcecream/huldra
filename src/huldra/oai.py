@@ -207,7 +207,12 @@ def _record_from_element(
     identifier = _text(header.find(f"{{{OAI_NS}}}identifier"))
     if identifier is None:
         raise ValueError("OAI record missing identifier")
-    datestamp = _parse_oai_datestamp(_text(header.find(f"{{{OAI_NS}}}datestamp")))
+    raw_datestamp = _text(header.find(f"{{{OAI_NS}}}datestamp"))
+    if raw_datestamp is None:
+        raise ValueError("OAI record missing datestamp")
+    datestamp = _parse_oai_datestamp(raw_datestamp)
+    if datestamp is None:
+        raise ValueError(f"OAI record {identifier} has invalid datestamp")
     set_specs = [
         value
         for value in (_text(element) for element in header.findall(f"{{{OAI_NS}}}setSpec"))
