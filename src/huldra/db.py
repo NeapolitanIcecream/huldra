@@ -98,9 +98,18 @@ class HuldraStore:
                         raw_atom_json=excluded.raw_atom_json,
                         authors_detail_json=excluded.authors_detail_json,
                         license=excluded.license,
-                        oai_identifier=excluded.oai_identifier,
-                        oai_datestamp=excluded.oai_datestamp,
-                        oai_set_specs_json=excluded.oai_set_specs_json,
+                        oai_identifier=CASE
+                            WHEN excluded.oai_identifier IS NULL THEN oai_identifier
+                            ELSE excluded.oai_identifier
+                        END,
+                        oai_datestamp=CASE
+                            WHEN excluded.oai_identifier IS NULL THEN oai_datestamp
+                            ELSE excluded.oai_datestamp
+                        END,
+                        oai_set_specs_json=CASE
+                            WHEN excluded.oai_identifier IS NULL THEN oai_set_specs_json
+                            ELSE excluded.oai_set_specs_json
+                        END,
                         links_json=excluded.links_json,
                         versions_json=excluded.versions_json,
                         withdrawn=excluded.withdrawn,

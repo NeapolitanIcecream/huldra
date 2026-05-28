@@ -28,6 +28,61 @@ def test_store_records_completed_cache_and_reads_ordered_papers(
     assert [paper.arxiv_id for paper in papers] == ["2401.00001v1"]
 
 
+def test_upsert_papers_preserves_oai_provenance_from_legacy_refresh(
+    store: HuldraStore,
+) -> None:
+    oai_datestamp = datetime(2026, 5, 27, tzinfo=UTC)
+    oai_paper = make_paper("2401.00001v1").model_copy(
+        update={
+            "title": "OAI Paper",
+            "oai_identifier": "oai:arXiv.org:2401.00001",
+            "oai_datestamp": oai_datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+    legacy_refresh = make_paper("2401.00001v1").model_copy(update={"title": "Legacy Refresh"})
+
+    store.upsert_papers([oai_paper])
+    store.upsert_papers([legacy_refresh])
+
+    paper = store.get_paper("2401.00001v1")
+    assert paper is not None
+    assert paper.title == "Legacy Refresh"
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00001"
+    assert paper.oai_datestamp == oai_datestamp
+    assert paper.oai_set_specs == ["cs:cs:AI"]
+
+
+def test_upsert_papers_allows_oai_refresh_to_update_oai_provenance(
+    store: HuldraStore,
+) -> None:
+    first_datestamp = datetime(2026, 5, 27, tzinfo=UTC)
+    refreshed_datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    first_oai_paper = make_paper("2401.00001v1").model_copy(
+        update={
+            "oai_identifier": "oai:arXiv.org:2401.00001",
+            "oai_datestamp": first_datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+    refreshed_oai_paper = make_paper("2401.00001v1").model_copy(
+        update={
+            "oai_identifier": "oai:arXiv.org:2401.00001",
+            "oai_datestamp": refreshed_datestamp,
+            "oai_set_specs": [],
+        }
+    )
+
+    store.upsert_papers([first_oai_paper])
+    store.upsert_papers([refreshed_oai_paper])
+
+    paper = store.get_paper("2401.00001v1")
+    assert paper is not None
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00001"
+    assert paper.oai_datestamp == refreshed_datestamp
+    assert paper.oai_set_specs == []
+
+
 def test_enqueue_dedupes_pending_cache_key(store: HuldraStore) -> None:
     request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
     first = store.enqueue_request(request)
