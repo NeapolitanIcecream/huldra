@@ -83,6 +83,75 @@ def test_upsert_papers_allows_oai_refresh_to_update_oai_provenance(
     assert paper.oai_set_specs == []
 
 
+def test_upsert_papers_preserves_oai_tombstone_from_legacy_refresh(
+    store: HuldraStore,
+) -> None:
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    legacy_paper = make_paper("2401.00002v1")
+    legacy_refresh = make_paper("2401.00002v1").model_copy(update={"title": "Legacy Refresh"})
+
+    store.upsert_papers([legacy_paper])
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00002",
+                arxiv_id="2401.00002",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                deleted=True,
+            )
+        ]
+    )
+    store.upsert_papers([legacy_refresh])
+
+    paper = store.get_paper("2401.00002v1")
+    assert paper is not None
+    assert paper.title == "Legacy Refresh"
+    assert paper.deleted
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00002"
+    assert paper.oai_datestamp == datestamp
+    assert paper.oai_set_specs == ["cs:cs:AI"]
+
+
+def test_upsert_papers_allows_oai_refresh_to_clear_oai_tombstone(
+    store: HuldraStore,
+) -> None:
+    tombstone_datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    refreshed_datestamp = datetime(2026, 5, 29, tzinfo=UTC)
+    legacy_paper = make_paper("2401.00003v1")
+    oai_refresh = make_paper("2401.00003v1").model_copy(
+        update={
+            "title": "OAI Refresh",
+            "oai_identifier": "oai:arXiv.org:2401.00003",
+            "oai_datestamp": refreshed_datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+
+    store.upsert_papers([legacy_paper])
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00003",
+                arxiv_id="2401.00003",
+                metadata_prefix="arXiv",
+                datestamp=tombstone_datestamp,
+                set_specs=["cs:cs:AI"],
+                deleted=True,
+            )
+        ]
+    )
+    store.upsert_papers([oai_refresh])
+
+    paper = store.get_paper("2401.00003v1")
+    assert paper is not None
+    assert paper.title == "OAI Refresh"
+    assert not paper.deleted
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00003"
+    assert paper.oai_datestamp == refreshed_datestamp
+
+
 def test_upsert_oai_deleted_record_marks_versioned_legacy_paper(
     store: HuldraStore,
 ) -> None:

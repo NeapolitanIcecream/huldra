@@ -113,7 +113,10 @@ class HuldraStore:
                         links_json=excluded.links_json,
                         versions_json=excluded.versions_json,
                         withdrawn=excluded.withdrawn,
-                        deleted=excluded.deleted,
+                        deleted=CASE
+                            WHEN excluded.oai_identifier IS NULL THEN deleted
+                            ELSE excluded.deleted
+                        END,
                         raw_metadata_json=excluded.raw_metadata_json,
                         last_seen_at=excluded.last_seen_at
                     """,
