@@ -3,12 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+import pytest
+
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import NonRetryableFetchError
+from huldra.fetcher import NonRetryableFetchError, RateLimitedError
 from huldra.models import OaiHarvestMode, OaiHarvestRequest, OaiMetadataPrefix
-from huldra.oai import OaiPmhPage, parse_oai_pmh_list_records
+from huldra.oai import OaiPmhFetcher, OaiPmhPage, parse_oai_pmh_list_records
 
 OAI_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
 <OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
@@ -172,6 +175,46 @@ def test_oai_parser_handles_arxiv_raw_record_versions_and_metadata() -> None:
     assert [version["version"] for version in paper.versions] == ["v1", "v2"]
     assert paper.updated_at is not None
     assert paper.updated_at.isoformat() == "2024-01-02T00:00:00+00:00"
+
+
+def test_oai_fetcher_503_retry_after_enters_rate_limit_flow(settings: HuldraSettings) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, headers={"Retry-After": "42"})
+        )
+    )
+
+    with pytest.raises(RateLimitedError) as exc:
+        OaiPmhFetcher(settings, client=client).list_records(metadata_prefix="arXiv")
+
+    assert exc.value.retry_after_seconds == 42
+
+
+def test_oai_harvest_503_retry_after_persists_oai_cooldown(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, headers={"Retry-After": "42"})
+        )
+    )
+    broker = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=OaiPmhFetcher(settings, client=client),
+    )
+
+    result = broker.harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    rate_state = store.get_rate_state("arxiv_oai_pmh")
+    assert result.status == "rate_limited"
+    assert result.error_message is not None
+    assert "cooldown_until=" in result.error_message
+    assert rate_state.cooldown_until is not None
+    assert rate_state.last_status == 503
 
 
 def test_oai_harvest_follows_resumption_token_and_advances_watermark(

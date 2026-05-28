@@ -130,6 +130,7 @@ def test_complete_window_cli_requires_wait(tmp_path: Path) -> None:
             "--mode",
             "complete-window",
         ],
+        color=False,
     )
 
     assert result.exit_code != 0

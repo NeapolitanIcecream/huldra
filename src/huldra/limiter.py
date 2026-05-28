@@ -105,6 +105,8 @@ class HuldraRateLimiter:
         *,
         owner_token: str,
         retry_after_seconds: int | None,
+        status_code: int = 429,
+        error_message: str | None = None,
         now: datetime | None = None,
     ) -> datetime:
         current = ensure_utc(now or utc_now())
@@ -118,8 +120,8 @@ class HuldraRateLimiter:
                 cooldown_until=cooldown_until,
                 consecutive_429_total=previous.consecutive_429_total + 1,
                 upstream_429_total=previous.upstream_429_total + 1,
-                last_status=429,
-                last_error_message="arXiv returned HTTP 429",
+                last_status=status_code,
+                last_error_message=error_message or f"arXiv returned HTTP {status_code}",
             )
         )
         self.store.release_lease(self.lease_name, owner_token)

@@ -21,8 +21,14 @@ class HuldraFetchError(RuntimeError):
 
 
 class RateLimitedError(HuldraFetchError):
-    def __init__(self, retry_after_seconds: int | None, message: str = "rate limited") -> None:
-        super().__init__(message, status_code=429)
+    def __init__(
+        self,
+        retry_after_seconds: int | None,
+        message: str = "rate limited",
+        *,
+        status_code: int = 429,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
         self.retry_after_seconds = retry_after_seconds
 
 

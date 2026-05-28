@@ -142,7 +142,7 @@ Run an OAI-PMH harvest for complete or category-scoped metadata sync:
 uv run huldra harvest oai \
   --db ~/.local/share/huldra/huldra.db \
   --metadata-prefix arXiv \
-  --set cs:cs.AI \
+  --set cs:cs:AI \
   --mode incremental \
   --json
 ```

@@ -891,6 +891,7 @@ class HuldraStore:
         cache_key: str,
         request: ArxivRequest,
         cooldown_until: datetime,
+        upstream_status: int = 429,
         error_message: str = "arXiv returned HTTP 429",
     ) -> None:
         self.record_cache_failure(
@@ -898,7 +899,7 @@ class HuldraStore:
             request=request,
             status="rate_limited",
             cooldown_until=cooldown_until,
-            upstream_status=429,
+            upstream_status=upstream_status,
             error_category="rate_limited",
             error_message=error_message,
         )

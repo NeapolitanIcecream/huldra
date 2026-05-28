@@ -83,8 +83,15 @@ class OaiPmhFetcher:
         else:
             response = self._get_once(self._client, params, headers)
 
+        retry_after = response.headers.get("Retry-After")
         if response.status_code == 429:
-            raise RateLimitedError(_parse_retry_after_seconds(response.headers.get("Retry-After")))
+            raise RateLimitedError(_parse_retry_after_seconds(retry_after))
+        if response.status_code == 503 and retry_after is not None:
+            raise RateLimitedError(
+                _parse_retry_after_seconds(retry_after),
+                "arXiv OAI-PMH returned HTTP 503 with Retry-After",
+                status_code=response.status_code,
+            )
         if response.status_code >= 500:
             raise TransientFetchError(
                 f"arXiv OAI-PMH returned HTTP {response.status_code}",

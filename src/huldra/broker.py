@@ -253,6 +253,8 @@ class HuldraBroker:
                 cooldown_until = limiter.after_429(
                     owner_token=owner_token,
                     retry_after_seconds=exc.retry_after_seconds,
+                    status_code=exc.status_code or 429,
+                    error_message=str(exc),
                 )
                 self.store.record_oai_page(
                     harvest_id=harvest_id,
