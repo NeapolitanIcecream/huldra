@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from huldra.keys import arxiv_id_family_base, normalize_arxiv_id, request_cache_key
+from huldra.keys import arxiv_id_family_base, arxiv_version, normalize_arxiv_id, request_cache_key
 from huldra.migrations import apply_migrations
 from huldra.models import (
     ArxivPaper,
@@ -70,85 +70,93 @@ class HuldraStore:
         assert timestamp is not None
         with self.begin_immediate() as conn:
             for paper in papers:
-                conn.execute(
-                    """
-                    INSERT INTO papers (
-                        arxiv_id, version, canonical_url, title, abstract,
-                        authors_json, primary_category, categories_json,
-                        published_at, updated_at, comment, journal_ref, doi,
-                        raw_atom_json, authors_detail_json, license,
-                        oai_identifier, oai_datestamp, oai_set_specs_json,
-                        links_json, versions_json, withdrawn, deleted,
-                        raw_metadata_json, first_seen_at, last_seen_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(arxiv_id) DO UPDATE SET
-                        version=excluded.version,
-                        canonical_url=excluded.canonical_url,
-                        title=excluded.title,
-                        abstract=excluded.abstract,
-                        authors_json=excluded.authors_json,
-                        primary_category=excluded.primary_category,
-                        categories_json=excluded.categories_json,
-                        published_at=excluded.published_at,
-                        updated_at=excluded.updated_at,
-                        comment=excluded.comment,
-                        journal_ref=excluded.journal_ref,
-                        doi=excluded.doi,
-                        raw_atom_json=excluded.raw_atom_json,
-                        authors_detail_json=excluded.authors_detail_json,
-                        license=excluded.license,
-                        oai_identifier=CASE
-                            WHEN excluded.oai_identifier IS NULL THEN oai_identifier
-                            ELSE excluded.oai_identifier
-                        END,
-                        oai_datestamp=CASE
-                            WHEN excluded.oai_identifier IS NULL THEN oai_datestamp
-                            ELSE excluded.oai_datestamp
-                        END,
-                        oai_set_specs_json=CASE
-                            WHEN excluded.oai_identifier IS NULL THEN oai_set_specs_json
-                            ELSE excluded.oai_set_specs_json
-                        END,
-                        links_json=excluded.links_json,
-                        versions_json=excluded.versions_json,
-                        withdrawn=excluded.withdrawn,
-                        deleted=CASE
-                            WHEN excluded.oai_identifier IS NULL THEN deleted
-                            ELSE excluded.deleted
-                        END,
-                        raw_metadata_json=excluded.raw_metadata_json,
-                        last_seen_at=excluded.last_seen_at
-                    """,
-                    (
-                        paper.arxiv_id,
-                        paper.version,
-                        paper.canonical_url,
-                        paper.title,
-                        paper.abstract,
-                        json.dumps(paper.authors, separators=(",", ":")),
-                        paper.primary_category,
-                        json.dumps(paper.categories, separators=(",", ":")),
-                        isoformat_or_none(paper.published_at),
-                        isoformat_or_none(paper.updated_at),
-                        paper.comment,
-                        paper.journal_ref,
-                        paper.doi,
-                        json.dumps(paper.raw_atom, sort_keys=True, separators=(",", ":")),
-                        json.dumps(paper.authors_detail, sort_keys=True, separators=(",", ":")),
-                        paper.license,
-                        paper.oai_identifier,
-                        isoformat_or_none(paper.oai_datestamp),
-                        json.dumps(paper.oai_set_specs, sort_keys=True, separators=(",", ":")),
-                        json.dumps(paper.links, sort_keys=True, separators=(",", ":")),
-                        json.dumps(paper.versions, sort_keys=True, separators=(",", ":")),
-                        int(paper.withdrawn),
-                        int(paper.deleted),
-                        json.dumps(paper.raw_metadata, sort_keys=True, separators=(",", ":")),
-                        timestamp,
-                        timestamp,
-                    ),
-                )
+                self._upsert_paper_conn(conn, paper, timestamp)
+
+    def _upsert_paper_conn(
+        self,
+        conn: sqlite3.Connection,
+        paper: ArxivPaper,
+        timestamp: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO papers (
+                arxiv_id, version, canonical_url, title, abstract,
+                authors_json, primary_category, categories_json,
+                published_at, updated_at, comment, journal_ref, doi,
+                raw_atom_json, authors_detail_json, license,
+                oai_identifier, oai_datestamp, oai_set_specs_json,
+                links_json, versions_json, withdrawn, deleted,
+                raw_metadata_json, first_seen_at, last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(arxiv_id) DO UPDATE SET
+                version=excluded.version,
+                canonical_url=excluded.canonical_url,
+                title=excluded.title,
+                abstract=excluded.abstract,
+                authors_json=excluded.authors_json,
+                primary_category=excluded.primary_category,
+                categories_json=excluded.categories_json,
+                published_at=excluded.published_at,
+                updated_at=excluded.updated_at,
+                comment=excluded.comment,
+                journal_ref=excluded.journal_ref,
+                doi=excluded.doi,
+                raw_atom_json=excluded.raw_atom_json,
+                authors_detail_json=excluded.authors_detail_json,
+                license=excluded.license,
+                oai_identifier=CASE
+                    WHEN excluded.oai_identifier IS NULL THEN oai_identifier
+                    ELSE excluded.oai_identifier
+                END,
+                oai_datestamp=CASE
+                    WHEN excluded.oai_identifier IS NULL THEN oai_datestamp
+                    ELSE excluded.oai_datestamp
+                END,
+                oai_set_specs_json=CASE
+                    WHEN excluded.oai_identifier IS NULL THEN oai_set_specs_json
+                    ELSE excluded.oai_set_specs_json
+                END,
+                links_json=excluded.links_json,
+                versions_json=excluded.versions_json,
+                withdrawn=excluded.withdrawn,
+                deleted=CASE
+                    WHEN excluded.oai_identifier IS NULL THEN deleted
+                    ELSE excluded.deleted
+                END,
+                raw_metadata_json=excluded.raw_metadata_json,
+                last_seen_at=excluded.last_seen_at
+            """,
+            (
+                paper.arxiv_id,
+                paper.version,
+                paper.canonical_url,
+                paper.title,
+                paper.abstract,
+                json.dumps(paper.authors, separators=(",", ":")),
+                paper.primary_category,
+                json.dumps(paper.categories, separators=(",", ":")),
+                isoformat_or_none(paper.published_at),
+                isoformat_or_none(paper.updated_at),
+                paper.comment,
+                paper.journal_ref,
+                paper.doi,
+                json.dumps(paper.raw_atom, sort_keys=True, separators=(",", ":")),
+                json.dumps(paper.authors_detail, sort_keys=True, separators=(",", ":")),
+                paper.license,
+                paper.oai_identifier,
+                isoformat_or_none(paper.oai_datestamp),
+                json.dumps(paper.oai_set_specs, sort_keys=True, separators=(",", ":")),
+                json.dumps(paper.links, sort_keys=True, separators=(",", ":")),
+                json.dumps(paper.versions, sort_keys=True, separators=(",", ":")),
+                int(paper.withdrawn),
+                int(paper.deleted),
+                json.dumps(paper.raw_metadata, sort_keys=True, separators=(",", ":")),
+                timestamp,
+                timestamp,
+            ),
+        )
 
     def record_completed_cache_entry(
         self,
@@ -626,10 +634,16 @@ class HuldraStore:
             return (0, 0, 0)
         timestamp = isoformat_or_none(now or utc_now())
         assert timestamp is not None
-        papers = [record.paper for record in records if record.paper is not None and not record.deleted]
-        self.upsert_papers(papers, now=now)
+        papers_upserted = 0
         with self.begin_immediate() as conn:
             for record in records:
+                if record.paper is not None and not record.deleted:
+                    self._upsert_paper_conn(
+                        conn,
+                        _oai_paper_for_existing_version_family(conn, record.paper),
+                        timestamp,
+                    )
+                    papers_upserted += 1
                 existing = conn.execute(
                     """
                     SELECT first_seen_at FROM oai_records
@@ -689,7 +703,7 @@ class HuldraStore:
                         ),
                     )
 
-        return (len(records), len(papers), sum(1 for record in records if record.deleted))
+        return (len(records), papers_upserted, sum(1 for record in records if record.deleted))
 
     def get_latest_resumable_oai_harvest_token(self, request: OaiHarvestRequest) -> str | None:
         resumable_statuses = (
@@ -1605,6 +1619,28 @@ def _paper_arxiv_ids_in_version_family(conn: sqlite3.Connection, arxiv_id: str) 
         for row in rows
         if row["arxiv_id"] == base_id or arxiv_id_family_base(row["arxiv_id"]) == base_id
     )
+
+
+def _oai_paper_for_existing_version_family(
+    conn: sqlite3.Connection,
+    paper: ArxivPaper,
+) -> ArxivPaper:
+    arxiv_ids = _paper_arxiv_ids_in_version_family(conn, paper.arxiv_id)
+    if not arxiv_ids or paper.arxiv_id in arxiv_ids:
+        return paper
+    target_arxiv_id = max(arxiv_ids, key=_version_family_merge_preference)
+    target_version = arxiv_version(target_arxiv_id)
+    update: dict[str, Any] = {
+        "arxiv_id": target_arxiv_id,
+        "canonical_url": f"https://arxiv.org/abs/{target_arxiv_id}",
+    }
+    if target_version is not None:
+        update["version"] = target_version
+    return paper.model_copy(update=update)
+
+
+def _version_family_merge_preference(arxiv_id: str) -> tuple[int, str]:
+    return (arxiv_version(arxiv_id) or -1, arxiv_id)
 
 
 def _sqlite_like_escape(value: str) -> str:

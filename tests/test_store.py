@@ -185,6 +185,54 @@ def test_upsert_oai_deleted_record_marks_versioned_legacy_paper(
     assert not unrelated.deleted
 
 
+def test_upsert_oai_record_merges_non_deleted_paper_into_versioned_legacy_row(
+    store: HuldraStore,
+) -> None:
+    legacy_paper = make_paper("2401.00004v1")
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    oai_paper = make_paper("2401.00004").model_copy(
+        update={
+            "title": "OAI Refresh",
+            "oai_identifier": "oai:arXiv.org:2401.00004",
+            "oai_datestamp": datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+
+    store.upsert_papers([legacy_paper])
+    result = store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00004",
+                arxiv_id="2401.00004",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                paper=oai_paper,
+            )
+        ]
+    )
+
+    paper = store.get_paper("2401.00004v1")
+    duplicate = store.get_paper("2401.00004")
+    with store.connect() as conn:
+        family_count = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE arxiv_id IN ('2401.00004', '2401.00004v1')"
+        ).fetchone()[0]
+
+    assert result == (1, 1, 0)
+    assert paper is not None
+    assert paper.arxiv_id == "2401.00004v1"
+    assert paper.version == 1
+    assert paper.canonical_url == "https://arxiv.org/abs/2401.00004v1"
+    assert paper.title == "OAI Refresh"
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00004"
+    assert paper.oai_datestamp == datestamp
+    assert paper.oai_set_specs == ["cs:cs:AI"]
+    assert duplicate is None
+    assert family_count == 1
+
+
 def test_enqueue_dedupes_pending_cache_key(store: HuldraStore) -> None:
     request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
     first = store.enqueue_request(request)
