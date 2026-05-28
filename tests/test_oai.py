@@ -9,7 +9,7 @@ import pytest
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import NonRetryableFetchError, RateLimitedError
+from huldra.fetcher import NonRetryableFetchError, RateLimitedError, TransientFetchError
 from huldra.models import OaiHarvestMode, OaiHarvestRequest, OaiMetadataPrefix
 from huldra.oai import OaiPmhFetcher, OaiPmhPage, parse_oai_pmh_list_records
 
@@ -190,6 +190,20 @@ def test_oai_fetcher_503_retry_after_enters_rate_limit_flow(settings: HuldraSett
     assert exc.value.retry_after_seconds == 42
 
 
+def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
+    settings: HuldraSettings,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="<OAI-PMH"))
+    )
+
+    with pytest.raises(TransientFetchError) as exc:
+        OaiPmhFetcher(settings, client=client).list_records(metadata_prefix="arXiv")
+
+    assert exc.value.status_code == 200
+    assert "malformed XML" in str(exc.value)
+
+
 def test_oai_harvest_503_retry_after_persists_oai_cooldown(
     store: HuldraStore,
     settings: HuldraSettings,
@@ -215,6 +229,37 @@ def test_oai_harvest_503_retry_after_persists_oai_cooldown(
     assert "cooldown_until=" in result.error_message
     assert rate_state.cooldown_until is not None
     assert rate_state.last_status == 503
+
+
+def test_oai_harvest_malformed_200_records_failure_and_releases_limiter(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="<OAI-PMH"))
+    )
+    broker = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=OaiPmhFetcher(settings, client=client),
+    )
+
+    result = broker.harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    with store.connect() as conn:
+        page = conn.execute("SELECT status, error_category FROM oai_pages").fetchone()
+        job = conn.execute("SELECT status, error_category FROM oai_harvest_jobs").fetchone()
+    assert result.status == "transient_failure"
+    assert result.error_category == "transient"
+    assert page is not None
+    assert page["status"] == "transient_failure"
+    assert page["error_category"] == "transient"
+    assert job is not None
+    assert job["status"] == "transient_failure"
+    assert job["error_category"] == "transient"
+    assert store.acquire_lease("upstream_fetch", "probe", 60)
 
 
 def test_oai_harvest_follows_resumption_token_and_advances_watermark(

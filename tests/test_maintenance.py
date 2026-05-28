@@ -10,7 +10,7 @@ from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.fetcher import FetchResult, NonRetryableFetchError, RateLimitedError
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest, CachePolicy, RateState, ReadinessMode
+from huldra.models import ArxivRequest, CachePolicy, CoverageStatus, RateState, ReadinessMode
 from huldra.planner import build_submitted_date_windows
 from huldra.time import utc_now
 from tests.conftest import make_paper
@@ -120,6 +120,38 @@ def test_sync_windows_reports_joined_existing_queue_without_counting_upstream(
     assert result.queued_total == 1
     assert result.upstream_requests_total == 0
     assert result.requests[0].joined_existing_queue
+
+
+def test_sync_windows_async_cache_miss_completes_sync_job_as_queued(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    target = ArxivRequest(client_id="recoleta:test", search_query="cat:cs.AI")
+    broker = HuldraBroker(store=store, settings=settings)
+
+    result = broker.sync_windows([target], wait=False)
+
+    sync_job_id = result.requests[0].sync_job_id
+    assert sync_job_id is not None
+    job = store.get_sync_job(sync_job_id)
+    assert job is not None
+    assert job["status"] == "queued"
+    assert job["coverage_status"] == CoverageStatus.UNKNOWN
+    assert job["pages_total"] == 1
+    assert job["pages_completed_total"] == 0
+    with store.connect() as conn:
+        page = conn.execute(
+            "SELECT status FROM sync_job_pages WHERE sync_job_id = ?",
+            (sync_job_id,),
+        ).fetchone()
+        sync_job_row = conn.execute(
+            "SELECT completed_at FROM sync_jobs WHERE sync_job_id = ?",
+            (sync_job_id,),
+        ).fetchone()
+    assert page is not None
+    assert page["status"] == "queued"
+    assert sync_job_row is not None
+    assert sync_job_row["completed_at"] is not None
 
 
 def test_sync_windows_wait_returns_when_global_cooldown_blocks_target(

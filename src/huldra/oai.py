@@ -102,7 +102,13 @@ class OaiPmhFetcher:
                 f"arXiv OAI-PMH returned HTTP {response.status_code}",
                 status_code=response.status_code,
             )
-        page = parse_oai_pmh_list_records(response.text, metadata_prefix=metadata_prefix)
+        try:
+            page = parse_oai_pmh_list_records(response.text, metadata_prefix=metadata_prefix)
+        except ElementTree.ParseError as exc:
+            raise TransientFetchError(
+                "arXiv OAI-PMH returned malformed XML",
+                status_code=response.status_code,
+            ) from exc
         page = OaiPmhPage(
             records=page.records,
             response_date=page.response_date,

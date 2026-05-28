@@ -40,6 +40,10 @@ log = logger.bind(module="huldra.broker")
 _PENDING_QUEUE_STATUSES = frozenset({"queued", "delayed", "claimed"})
 _TERMINAL_DELAYED_ERROR_CATEGORIES = frozenset({"cooldown", "rate_limited"})
 _INLINE_UPSTREAM_STATUSES = frozenset({"completed", "rate_limited", "transient_failure", "failed"})
+_SYNC_JOB_TERMINAL_RAW_STATUSES = frozenset(
+    {"completed", "failed", "rate_limited", "cache_unreadable", "skipped"}
+)
+_ASYNC_SYNC_JOB_HANDOFF_STATUSES = frozenset({"queued", "delayed", "claimed"})
 
 
 @dataclass(slots=True)
@@ -440,6 +444,13 @@ class HuldraBroker:
             )
             target.request_id = item.request_id
             target.joined_existing_queue = joined
+            if target.sync_job_id is not None:
+                self.store.record_sync_job_page(
+                    sync_job_id=target.sync_job_id,
+                    request=target.request,
+                    cache_key=target.cache_key,
+                    status=_raw_status_from_queue_item(item) or str(item.status),
+                )
             result.queued_total += 1
 
         if wait and targets:
@@ -454,7 +465,12 @@ class HuldraBroker:
                     ).model_dump()
                 )
 
-        return self._finalize_maintenance_result(targets, result, mode=mode)
+        return self._finalize_maintenance_result(
+            targets,
+            result,
+            mode=mode,
+            complete_pending_jobs=not wait,
+        )
 
     def backfill_windows(
         self,
@@ -912,6 +928,7 @@ class HuldraBroker:
         result: HuldraMaintenanceResult,
         *,
         mode: LegacySyncMode,
+        complete_pending_jobs: bool = False,
     ) -> HuldraMaintenanceResult:
         entries: list[HuldraMaintenanceRequestResult] = []
         completed_total = 0
@@ -1016,7 +1033,13 @@ class HuldraBroker:
             if (
                 target.sync_job_id is not None
                 and mode == LegacySyncMode.SLICE
-                and raw_status in {"completed", "failed", "rate_limited", "cache_unreadable", "skipped"}
+                and (
+                    raw_status in _SYNC_JOB_TERMINAL_RAW_STATUSES
+                    or (
+                        complete_pending_jobs
+                        and raw_status in _ASYNC_SYNC_JOB_HANDOFF_STATUSES
+                    )
+                )
             ):
                 self.store.complete_sync_job(
                     sync_job_id=target.sync_job_id,
