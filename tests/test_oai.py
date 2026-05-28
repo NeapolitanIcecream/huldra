@@ -21,7 +21,7 @@ OAI_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
       <header>
         <identifier>oai:arXiv.org:2401.00001</identifier>
         <datestamp>2026-05-27</datestamp>
-        <setSpec>cs:cs.AI</setSpec>
+        <setSpec>cs:cs:AI</setSpec>
       </header>
       <metadata>
         <arXiv xmlns="http://arxiv.org/OAI/arXiv/">
@@ -57,7 +57,7 @@ OAI_DELETED_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
       <header status="deleted">
         <identifier>oai:arXiv.org:2401.00002</identifier>
         <datestamp>2026-05-28</datestamp>
-        <setSpec>cs:cs.AI</setSpec>
+        <setSpec>cs:cs:AI</setSpec>
       </header>
     </record>
   </ListRecords>
@@ -71,7 +71,7 @@ OAI_RAW_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
       <header>
         <identifier>oai:arXiv.org:2401.00003</identifier>
         <datestamp>2026-05-27</datestamp>
-        <setSpec>cs:cs.AI</setSpec>
+        <setSpec>cs:cs:AI</setSpec>
       </header>
       <metadata>
         <arXivRaw xmlns="http://arxiv.org/OAI/arXivRaw/">
@@ -390,7 +390,7 @@ def test_oai_incremental_harvest_resumes_from_successful_watermark(
     monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
     store.set_oai_watermark(
         metadata_prefix="arXiv",
-        set_spec="cs:cs.AI",
+        set_spec="cs:cs:AI",
         last_response_date="2026-05-28T00:00:00Z",
         last_datestamp_seen="2026-05-27T00:00:00+00:00",
         harvest_id="previous",
@@ -408,14 +408,14 @@ def test_oai_incremental_harvest_resumes_from_successful_watermark(
         OaiHarvestRequest(
             client_id="test",
             metadata_prefix="arXiv",
-            set_spec="cs:cs.AI",
+            set_spec="cs:cs:AI",
             mode=OaiHarvestMode.INCREMENTAL,
         )
     )
 
     assert result.status == "completed"
     assert fetcher.seen[0]["from_datestamp"] == "2026-05-28T00:00:00Z"
-    assert fetcher.seen[0]["set_spec"] == "cs:cs.AI"
+    assert fetcher.seen[0]["set_spec"] == "cs:cs:AI"
 
 
 def test_oai_bounded_replay_does_not_advance_authoritative_watermark(

@@ -177,7 +177,7 @@ def test_client_harvest_oai_uses_http_api() -> None:
                     "harvest_id": "harvest-1",
                     "status": "completed",
                     "metadata_prefix": "arXiv",
-                    "set_spec": "cs:cs.AI",
+                    "set_spec": "cs:cs:AI",
                     "mode": "incremental",
                     "records_processed": 0,
                     "papers_upserted": 0,
@@ -195,7 +195,7 @@ def test_client_harvest_oai_uses_http_api() -> None:
     )
 
     result = client.harvest_oai(
-        OaiHarvestRequest(client_id="demo", metadata_prefix="arXiv", set_spec="cs:cs.AI")
+        OaiHarvestRequest(client_id="demo", metadata_prefix="arXiv", set_spec="cs:cs:AI")
     )
 
     assert result.status == "completed"
@@ -204,4 +204,4 @@ def test_client_harvest_oai_uses_http_api() -> None:
     payload = json.loads(requests[0].content)
     assert payload["client_id"] == "demo"
     assert payload["metadata_prefix"] == "arXiv"
-    assert payload["set_spec"] == "cs:cs.AI"
+    assert payload["set_spec"] == "cs:cs:AI"

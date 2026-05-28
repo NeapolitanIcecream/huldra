@@ -133,7 +133,7 @@ curl -X POST http://127.0.0.1:8765/v1/harvest/oai \
   -d '{
     "client_id": "mirror:cs-ai",
     "metadata_prefix": "arXiv",
-    "set_spec": "cs:cs.AI",
+    "set_spec": "cs:cs:AI",
     "mode": "incremental"
   }'
 ```
