@@ -109,6 +109,11 @@ class OaiPmhFetcher:
                 "arXiv OAI-PMH returned malformed XML",
                 status_code=response.status_code,
             ) from exc
+        except ValueError as exc:
+            raise TransientFetchError(
+                f"arXiv OAI-PMH returned malformed OAI record: {exc}",
+                status_code=response.status_code,
+            ) from exc
         page = OaiPmhPage(
             records=page.records,
             response_date=page.response_date,

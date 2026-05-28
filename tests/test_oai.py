@@ -110,6 +110,22 @@ OAI_ERROR = """<?xml version="1.0" encoding="UTF-8"?>
   <error code="badArgument">bad from value</error>
 </OAI-PMH>"""
 
+OAI_MALFORMED_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <ListRecords>
+    <record>
+      <metadata>
+        <arXiv xmlns="http://arxiv.org/OAI/arXiv/">
+          <id>2401.00004</id>
+          <created>2024-01-01</created>
+          <title>Missing Header</title>
+        </arXiv>
+      </metadata>
+    </record>
+  </ListRecords>
+</OAI-PMH>"""
+
 
 @dataclass
 class FakeOaiFetcher:
@@ -204,6 +220,22 @@ def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
     assert "malformed XML" in str(exc.value)
 
 
+def test_oai_fetcher_malformed_record_raises_transient_fetch_error(
+    settings: HuldraSettings,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text=OAI_MALFORMED_RECORD_PAGE)
+        )
+    )
+
+    with pytest.raises(TransientFetchError) as exc:
+        OaiPmhFetcher(settings, client=client).list_records(metadata_prefix="arXiv")
+
+    assert exc.value.status_code == 200
+    assert "malformed OAI record" in str(exc.value)
+
+
 def test_oai_harvest_503_retry_after_persists_oai_cooldown(
     store: HuldraStore,
     settings: HuldraSettings,
@@ -237,6 +269,39 @@ def test_oai_harvest_malformed_200_records_failure_and_releases_limiter(
 ) -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, text="<OAI-PMH"))
+    )
+    broker = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=OaiPmhFetcher(settings, client=client),
+    )
+
+    result = broker.harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    with store.connect() as conn:
+        page = conn.execute("SELECT status, error_category FROM oai_pages").fetchone()
+        job = conn.execute("SELECT status, error_category FROM oai_harvest_jobs").fetchone()
+    assert result.status == "transient_failure"
+    assert result.error_category == "transient"
+    assert page is not None
+    assert page["status"] == "transient_failure"
+    assert page["error_category"] == "transient"
+    assert job is not None
+    assert job["status"] == "transient_failure"
+    assert job["error_category"] == "transient"
+    assert store.acquire_lease("upstream_fetch", "probe", 60)
+
+
+def test_oai_harvest_malformed_record_records_failure_and_releases_limiter(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text=OAI_MALFORMED_RECORD_PAGE)
+        )
     )
     broker = HuldraBroker(
         store=store,
