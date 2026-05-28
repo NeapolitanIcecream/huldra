@@ -243,7 +243,10 @@ The OAI-PMH surface uses `https://oaipmh.arxiv.org/oai` by default and stores
 harvest jobs, page state, watermarks, raw OAI records, deleted headers, and
 normalized paper metadata. Incremental harvests use the last successful server
 response date or datestamp watermark unless `--from` is provided explicitly.
-Watermarks advance only after all pages in the harvest succeed.
+Watermarks advance only after all pages in the harvest succeed. If a harvest
+stops after receiving a resumption token, rerun the same harvest and Huldra will
+continue from the saved token. To continue from a specific token, pass
+`--resumption-token`.
 
 Use legacy search for request-sized slices and complete-window maintenance.
 Use OAI-PMH for full mirrors, category-scoped mirrors, and datestamp-based

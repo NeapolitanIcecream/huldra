@@ -382,6 +382,92 @@ def test_oai_failed_page_does_not_advance_watermark(
     assert store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None) is None
 
 
+def test_oai_harvest_auto_resumes_pending_token_after_rate_limit(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    first = parse_oai_pmh_list_records(OAI_PAGE)
+    final = parse_oai_pmh_list_records(OAI_DELETED_PAGE)
+    interrupted_fetcher = FakeOaiFetcher([first, RateLimitedError(0)], [])
+
+    interrupted = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=interrupted_fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    assert interrupted.status == "rate_limited"
+    assert interrupted.records_processed == 1
+    assert interrupted.resumption_token == "next-token"
+    assert interrupted_fetcher.seen[1]["resumption_token"] == "next-token"
+
+    resume_fetcher = FakeOaiFetcher([final], [])
+    resumed = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=resume_fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    assert resumed.status == "completed"
+    assert resumed.records_processed == 1
+    assert resumed.current_watermark == "2026-05-29T00:00:00Z"
+    assert resume_fetcher.seen[0]["resumption_token"] == "next-token"
+    assert resume_fetcher.seen[0]["from_datestamp"] is None
+    watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
+    assert watermark is not None
+    assert watermark["last_response_date"] == "2026-05-29T00:00:00Z"
+
+    fresh_fetcher = FakeOaiFetcher([final], [])
+    fresh = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=fresh_fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    assert fresh.status == "completed"
+    assert fresh_fetcher.seen[0]["resumption_token"] is None
+
+
+def test_oai_harvest_request_resumption_token_starts_with_token(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    page = parse_oai_pmh_list_records(
+        OAI_DELETED_PAGE.replace(
+            "<datestamp>2026-05-28</datestamp>",
+            "<datestamp>2026-05-30</datestamp>",
+        )
+    )
+    fetcher = FakeOaiFetcher([page], [])
+
+    result = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            resumption_token="resume-token",
+        )
+    )
+
+    assert result.status == "completed"
+    assert fetcher.seen[0]["resumption_token"] == "resume-token"
+    assert fetcher.seen[0]["from_datestamp"] is None
+
+
 def test_oai_incremental_harvest_resumes_from_successful_watermark(
     store: HuldraStore,
     settings: HuldraSettings,

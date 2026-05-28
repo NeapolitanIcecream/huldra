@@ -92,7 +92,9 @@ uv run huldra harvest oai \
 ```
 
 Harvests store page state and advance the `(metadata_prefix, set_spec)`
-watermark only after every resumption-token page succeeds.
+watermark only after every resumption-token page succeeds. If a harvest stops
+after receiving a token, rerunning the same command continues from the saved
+token. Use `--resumption-token` to continue from a specific token.
 
 ## systemd User Service
 

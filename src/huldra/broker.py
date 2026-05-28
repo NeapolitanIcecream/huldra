@@ -194,6 +194,10 @@ class HuldraBroker:
         return self.store.status_summary()
 
     def harvest_oai(self, request: OaiHarvestRequest) -> OaiHarvestResult:
+        resumption_token = (
+            request.resumption_token
+            or self.store.get_latest_resumable_oai_harvest_token(request)
+        )
         harvest_id = self.store.create_oai_harvest_job(request)
         fetcher = self.oai_fetcher or OaiPmhFetcher(self.settings)
         limiter = HuldraRateLimiter(
@@ -203,8 +207,11 @@ class HuldraBroker:
             lease_name="upstream_fetch",
         )
         owner_token = f"oai:{harvest_id}"
-        from_datestamp = self._oai_start_datestamp(request)
-        resumption_token = None
+        from_datestamp = (
+            None
+            if resumption_token is not None
+            else self._oai_start_datestamp(request)
+        )
         page_index = 0
         records_processed = 0
         papers_upserted = 0

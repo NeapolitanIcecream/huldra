@@ -195,7 +195,12 @@ def test_client_harvest_oai_uses_http_api() -> None:
     )
 
     result = client.harvest_oai(
-        OaiHarvestRequest(client_id="demo", metadata_prefix="arXiv", set_spec="cs:cs:AI")
+        OaiHarvestRequest(
+            client_id="demo",
+            metadata_prefix="arXiv",
+            set_spec="cs:cs:AI",
+            resumption_token="resume-token",
+        )
     )
 
     assert result.status == "completed"
@@ -205,3 +210,4 @@ def test_client_harvest_oai_uses_http_api() -> None:
     assert payload["client_id"] == "demo"
     assert payload["metadata_prefix"] == "arXiv"
     assert payload["set_spec"] == "cs:cs:AI"
+    assert payload["resumption_token"] == "resume-token"

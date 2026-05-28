@@ -383,6 +383,7 @@ class OaiHarvestRequest(HuldraModel):
     set_spec: str | None = None
     from_datestamp: str | None = None
     until_datestamp: str | None = None
+    resumption_token: str | None = None
     mode: OaiHarvestMode = OaiHarvestMode.INCREMENTAL
     cache_policy: CachePolicy = CachePolicy.CACHE_OR_ENQUEUE
     priority: int = 0
@@ -396,7 +397,7 @@ class OaiHarvestRequest(HuldraModel):
             raise ValueError("client_id cannot be blank")
         return value
 
-    @field_validator("set_spec", "from_datestamp", "until_datestamp")
+    @field_validator("set_spec", "from_datestamp", "until_datestamp", "resumption_token")
     @classmethod
     def _oai_optional_string_not_blank(cls, value: str | None) -> str | None:
         if value is None:

@@ -139,7 +139,10 @@ curl -X POST http://127.0.0.1:8765/v1/harvest/oai \
 ```
 
 OAI harvest responses include `records_processed`, `papers_upserted`,
-`deleted_records`, `pages_total`, and `current_watermark`.
+`deleted_records`, `pages_total`, `current_watermark`, and `resumption_token`.
+If a harvest stops during cooldown after a token was received, repeat the same
+request to continue from the saved token. To resume from a specific token, add
+`"resumption_token": "..."` to the request body.
 
 ## Read A Paper
 

@@ -341,6 +341,13 @@ def harvest_oai(
         str | None,
         typer.Option("--until", help="Optional OAI until datestamp."),
     ] = None,
+    resumption_token: Annotated[
+        str | None,
+        typer.Option(
+            "--resumption-token",
+            help="Optional OAI resumptionToken to continue a harvest.",
+        ),
+    ] = None,
     mode: Annotated[
         str,
         typer.Option("--mode", help="initial or incremental."),
@@ -358,6 +365,7 @@ def harvest_oai(
             set_spec=set_spec,
             from_datestamp=from_datestamp,
             until_datestamp=until_datestamp,
+            resumption_token=resumption_token,
             mode=_parse_oai_mode(mode),
         )
     ).model_dump(mode="json")

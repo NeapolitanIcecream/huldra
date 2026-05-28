@@ -674,6 +674,43 @@ class HuldraStore:
                     )
         return (len(records), len(papers), sum(1 for record in records if record.deleted))
 
+    def get_latest_resumable_oai_harvest_token(self, request: OaiHarvestRequest) -> str | None:
+        resumable_statuses = (
+            "rate_limited",
+            "cooling_down",
+            "blocked",
+            "transient_failure",
+        )
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT request_json, status, resumption_token
+                FROM oai_harvest_jobs
+                WHERE metadata_prefix = ?
+                  AND COALESCE(set_spec, '') = ?
+                ORDER BY completed_at DESC, started_at DESC
+                LIMIT 50
+                """,
+                (
+                    request.metadata_prefix,
+                    _oai_set_key(request.set_spec),
+                ),
+            ).fetchall()
+        for row in rows:
+            try:
+                previous = _oai_request_from_json(row["request_json"])
+            except ValueError:
+                continue
+            if not _same_oai_resume_scope(previous, request):
+                continue
+            if row["status"] not in resumable_statuses:
+                return None
+            token = row["resumption_token"]
+            if isinstance(token, str) and token:
+                return token
+            return None
+        return None
+
     def get_oai_watermark(
         self,
         *,
@@ -1516,6 +1553,20 @@ def _request_from_json(value: str) -> ArxivRequest:
 
 def _oai_request_json(request: OaiHarvestRequest) -> str:
     return request.model_dump_json()
+
+
+def _oai_request_from_json(value: str) -> OaiHarvestRequest:
+    return OaiHarvestRequest.model_validate_json(value)
+
+
+def _same_oai_resume_scope(left: OaiHarvestRequest, right: OaiHarvestRequest) -> bool:
+    return (
+        left.metadata_prefix == right.metadata_prefix
+        and left.set_spec == right.set_spec
+        and left.from_datestamp == right.from_datestamp
+        and left.until_datestamp == right.until_datestamp
+        and left.mode == right.mode
+    )
 
 
 def _oai_set_key(set_spec: str | None) -> str:
