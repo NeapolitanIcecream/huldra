@@ -233,6 +233,133 @@ def test_upsert_oai_record_merges_non_deleted_paper_into_versioned_legacy_row(
     assert family_count == 1
 
 
+def test_legacy_versioned_cache_write_merges_into_existing_oai_base_row(
+    store: HuldraStore,
+) -> None:
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    oai_paper = make_paper("2401.00005").model_copy(
+        update={
+            "version": None,
+            "title": "OAI Base",
+            "oai_identifier": "oai:arXiv.org:2401.00005",
+            "oai_datestamp": datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+    legacy_refresh = make_paper("2401.00005v1").model_copy(update={"title": "Legacy Refresh"})
+    request = ArxivRequest(client_id="demo", id_list=("2401.00005v1",))
+    key = request_cache_key(request)
+
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00005",
+                arxiv_id="2401.00005",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                paper=oai_paper,
+            )
+        ]
+    )
+    store.record_completed_cache_entry(
+        cache_key=key,
+        request=request,
+        papers=[legacy_refresh],
+        total_results=1,
+    )
+
+    paper = store.get_paper("2401.00005")
+    duplicate = store.get_paper("2401.00005v1")
+    cached_papers = store.get_cached_papers(key)
+    with store.connect() as conn:
+        family_count = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE arxiv_id IN ('2401.00005', '2401.00005v1')"
+        ).fetchone()[0]
+        cache_match = conn.execute(
+            "SELECT arxiv_id FROM cache_matches WHERE cache_key = ?",
+            (key,),
+        ).fetchone()
+
+    assert paper is not None
+    assert paper.arxiv_id == "2401.00005"
+    assert paper.version is None
+    assert paper.title == "Legacy Refresh"
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00005"
+    assert paper.oai_datestamp == datestamp
+    assert paper.oai_set_specs == ["cs:cs:AI"]
+    assert duplicate is None
+    assert family_count == 1
+    assert cache_match["arxiv_id"] == "2401.00005"
+    assert [cached.arxiv_id for cached in cached_papers] == ["2401.00005"]
+
+
+def test_legacy_versioned_upsert_preserves_existing_oai_base_tombstone(
+    store: HuldraStore,
+) -> None:
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    oai_paper = make_paper("2401.00006").model_copy(
+        update={
+            "version": None,
+            "oai_identifier": "oai:arXiv.org:2401.00006",
+            "oai_datestamp": datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+    legacy_refresh = make_paper("2401.00006v1").model_copy(update={"title": "Legacy Refresh"})
+
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00006",
+                arxiv_id="2401.00006",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                paper=oai_paper,
+            )
+        ]
+    )
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00006",
+                arxiv_id="2401.00006",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                deleted=True,
+            )
+        ]
+    )
+    store.upsert_papers([legacy_refresh])
+
+    paper = store.get_paper("2401.00006")
+    duplicate = store.get_paper("2401.00006v1")
+
+    assert paper is not None
+    assert paper.arxiv_id == "2401.00006"
+    assert paper.title == "Legacy Refresh"
+    assert paper.deleted
+    assert paper.oai_identifier == "oai:arXiv.org:2401.00006"
+    assert paper.oai_datestamp == datestamp
+    assert paper.oai_set_specs == ["cs:cs:AI"]
+    assert duplicate is None
+
+
+def test_legacy_versioned_upsert_keeps_legacy_only_family_rows_distinct(
+    store: HuldraStore,
+) -> None:
+    base_paper = make_paper("2401.00007").model_copy(update={"version": None})
+    versioned_paper = make_paper("2401.00007v1")
+
+    store.upsert_papers([base_paper])
+    store.upsert_papers([versioned_paper])
+
+    assert store.get_paper("2401.00007") is not None
+    assert store.get_paper("2401.00007v1") is not None
+
+
 def test_enqueue_dedupes_pending_cache_key(store: HuldraStore) -> None:
     request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
     first = store.enqueue_request(request)

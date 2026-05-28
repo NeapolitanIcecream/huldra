@@ -77,7 +77,8 @@ class HuldraStore:
         conn: sqlite3.Connection,
         paper: ArxivPaper,
         timestamp: str,
-    ) -> None:
+    ) -> str:
+        paper = _legacy_paper_for_existing_oai_base_row(conn, paper)
         conn.execute(
             """
             INSERT INTO papers (
@@ -157,6 +158,7 @@ class HuldraStore:
                 timestamp,
             ),
         )
+        return paper.arxiv_id
 
     def record_completed_cache_entry(
         self,
@@ -174,8 +176,10 @@ class HuldraStore:
         requested = isoformat_or_none(requested_at or utc_now())
         completed = isoformat_or_none(completed_at or utc_now())
         assert requested is not None and completed is not None
-        self.upsert_papers(papers, now=completed_at)
         with self.begin_immediate() as conn:
+            matched_arxiv_ids = list(
+                dict.fromkeys(self._upsert_paper_conn(conn, paper, completed) for paper in papers)
+            )
             previous = conn.execute(
                 "SELECT upstream_requests_total FROM cache_entries WHERE cache_key = ?",
                 (cache_key,),
@@ -217,26 +221,26 @@ class HuldraStore:
                     completed,
                     upstream_status,
                     upstream_total,
-                    len(papers),
+                    len(matched_arxiv_ids),
                     total_results,
                     coverage_status,
                 ),
             )
             conn.execute("DELETE FROM cache_matches WHERE cache_key = ?", (cache_key,))
-            for position, paper in enumerate(papers):
+            for position, arxiv_id in enumerate(matched_arxiv_ids):
                 conn.execute(
                     """
                     INSERT INTO cache_matches(cache_key, arxiv_id, sort_position, matched_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (cache_key, paper.arxiv_id, position, completed),
+                    (cache_key, arxiv_id, position, completed),
                 )
             self._record_event_conn(
                 conn,
                 "fetch_success",
                 {
                     "cache_key": cache_key,
-                    "papers_total": len(papers),
+                    "papers_total": len(matched_arxiv_ids),
                     "upstream_status": upstream_status,
                     "coverage_status": coverage_status,
                 },
@@ -1637,6 +1641,33 @@ def _oai_paper_for_existing_version_family(
     if target_version is not None:
         update["version"] = target_version
     return paper.model_copy(update=update)
+
+
+def _legacy_paper_for_existing_oai_base_row(
+    conn: sqlite3.Connection,
+    paper: ArxivPaper,
+) -> ArxivPaper:
+    if paper.oai_identifier is not None or arxiv_version(paper.arxiv_id) is None:
+        return paper
+    base_id = arxiv_id_family_base(paper.arxiv_id)
+    arxiv_ids = _paper_arxiv_ids_in_version_family(conn, paper.arxiv_id)
+    if base_id not in arxiv_ids:
+        return paper
+    if any(arxiv_version(arxiv_id) is not None for arxiv_id in arxiv_ids):
+        return paper
+    base_row = conn.execute(
+        "SELECT oai_identifier FROM papers WHERE arxiv_id = ?",
+        (base_id,),
+    ).fetchone()
+    if base_row is None or base_row["oai_identifier"] is None:
+        return paper
+    return paper.model_copy(
+        update={
+            "arxiv_id": base_id,
+            "version": arxiv_version(base_id),
+            "canonical_url": f"https://arxiv.org/abs/{base_id}",
+        }
+    )
 
 
 def _version_family_merge_preference(arxiv_id: str) -> tuple[int, str]:
