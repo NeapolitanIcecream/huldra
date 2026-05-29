@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -9,7 +10,7 @@ from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.fetcher import FetchResult
-from huldra.models import ArxivRequest, CachePolicy
+from huldra.models import ArxivRequest, CachePolicy, OaiRecord
 from huldra.worker import HuldraWorker
 from tests.conftest import make_paper
 
@@ -70,6 +71,43 @@ def test_pure_id_list_composition_ignores_repeated_ids_when_writing_cache(
     assert [paper.arxiv_id for paper in result.papers] == ["2401.00001v1"]
     assert result.papers_total == 1
     assert result.cached_papers_total == 1
+
+
+def test_pure_id_list_composes_versioned_request_from_oai_base_row(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    oai_paper = make_paper("2401.00008").model_copy(
+        update={
+            "version": None,
+            "title": "OAI Base",
+            "oai_identifier": "oai:arXiv.org:2401.00008",
+            "oai_datestamp": datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00008",
+                arxiv_id="2401.00008",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                paper=oai_paper,
+            )
+        ]
+    )
+    request = ArxivRequest(client_id="demo", id_list=("2401.00008v1",))
+
+    result = HuldraBroker(store=store, settings=settings).ensure(request)
+
+    assert result.status == "ready"
+    assert result.cache_hit
+    assert result.request_id is None
+    assert [paper.arxiv_id for paper in result.papers] == ["2401.00008"]
+    assert store.status_summary().queue_depth_total == 0
 
 
 def test_id_list_worker_fetches_only_missing_ids_and_records_full_cache(

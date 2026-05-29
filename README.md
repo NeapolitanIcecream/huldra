@@ -1,9 +1,9 @@
 # Huldra
 
 Huldra is a local arXiv metadata broker for one machine. Programs that need
-arXiv papers can ask Huldra for metadata instead of each calling
-`export.arxiv.org` directly. Huldra shares a SQLite cache, request queue,
-durable rate limiter, cooldown state, and upstream lease across those programs.
+arXiv papers can ask Huldra for metadata instead of each calling arXiv
+directly. Huldra shares a SQLite cache, request queue, durable rate limiter,
+cooldown state, and upstream lease across those programs.
 
 Huldra is an independent package and CLI. It is not a plugin for another
 project, and it does not depend on [Recoleta](https://github.com/NeapolitanIcecream/recoleta).
@@ -96,7 +96,9 @@ Look up one cached paper:
 uv run huldra paper --db ~/.local/share/huldra/huldra.db --arxiv-id 2401.00001 --json
 ```
 
-Sync a submitted-date UTC day and optionally wait for the worker path inline:
+Sync a submitted-date UTC day and optionally wait for the worker path inline.
+By default this completes one legacy search slice and reports
+`coverage_status="slice"` even when arXiv says more results exist:
 
 ```bash
 uv run huldra sync \
@@ -104,6 +106,20 @@ uv run huldra sync \
   --search-query 'cat:cs.AI AND all:agent' \
   --date 2026-05-20 \
   --max-results 60 \
+  --wait \
+  --json
+```
+
+Fetch every legacy search page for a bounded window by opting into complete
+window mode:
+
+```bash
+uv run huldra sync \
+  --db ~/.local/share/huldra/huldra.db \
+  --search-query 'cat:cs.AI AND all:agent' \
+  --date 2026-05-20 \
+  --max-results 60 \
+  --mode complete-window \
   --wait \
   --json
 ```
@@ -117,6 +133,17 @@ uv run huldra backfill \
   --start-date 2026-05-01 \
   --end-date 2026-05-20 \
   --max-results 60 \
+  --json
+```
+
+Run an OAI-PMH harvest for complete or category-scoped metadata sync:
+
+```bash
+uv run huldra harvest oai \
+  --db ~/.local/share/huldra/huldra.db \
+  --metadata-prefix arXiv \
+  --set cs:cs:AI \
+  --mode incremental \
   --json
 ```
 
@@ -161,7 +188,9 @@ with HuldraClient(base_url="http://127.0.0.1:8765") as client:
 
 Maintenance completion means the raw cache is readable. The per-request
 `serving_status` still tells you whether the same cache is currently accepted
-by the request's readiness mode.
+by the request's readiness mode. For legacy search, check `coverage_status`,
+`completed_slices_total`, `pages_total`, and `pages_completed_total` before
+treating a window as complete.
 
 ## Safe Readiness
 
@@ -208,12 +237,28 @@ When arXiv returns HTTP 429, Huldra persists `cooldown_until` in SQLite. New
 requests can still be queued, but workers will not probe upstream again until
 the cooldown expires.
 
+## OAI-PMH Harvesting
+
+The OAI-PMH surface uses `https://oaipmh.arxiv.org/oai` by default and stores
+harvest jobs, page state, watermarks, raw OAI records, deleted headers, and
+normalized paper metadata. Incremental harvests use the last successful server
+response date or datestamp watermark unless `--from` is provided explicitly.
+Watermarks advance only after all pages in the harvest succeed. If a harvest
+stops after receiving a resumption token, rerun the same harvest and Huldra will
+continue from the saved token. To continue from a specific token, pass
+`--resumption-token`.
+
+Use legacy search for request-sized slices and complete-window maintenance.
+Use OAI-PMH for full mirrors, category-scoped mirrors, and datestamp-based
+incremental sync.
+
 ## Metadata-Only Boundary
 
-This MVP stores descriptive metadata from the arXiv API: IDs, titles,
-abstracts, authors, categories, publication dates, comments, journal references,
-DOIs, and small provenance fields. It does not cache or serve PDFs, source
-tarballs, generated full text, or paper HTML.
+This package stores descriptive metadata from arXiv: IDs, titles, abstracts,
+authors, categories, publication dates, comments, journal references, DOIs,
+OAI identifiers, OAI datestamps, set specs, license fields, deleted-record
+state, and raw metadata needed for reprocessing. It does not cache or serve
+PDFs, source tarballs, generated full text, or paper HTML.
 
 ## Non-Goals
 
@@ -221,4 +266,3 @@ tarballs, generated full text, or paper HTML.
 - No PDF, source, or full-text cache.
 - No multi-machine distributed limiter. For more than one machine, run one
   shared broker or add a future shared rate-state backend.
-- No OAI-PMH backend yet. The current backend is the legacy search API.

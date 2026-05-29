@@ -38,3 +38,22 @@ def test_atom_parser_handles_old_style_ids() -> None:
     paper = parse_arxiv_atom(feed).papers[0]
     assert paper.arxiv_id == "math/0309136v1"
     assert paper.version == 1
+
+
+def test_atom_parser_detects_documented_error_feed_without_paper() -> None:
+    feed = """<?xml version="1.0"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>http://arxiv.org/api/errors</id>
+        <link href="http://arxiv.org/api/errors" rel="alternate"/>
+        <title>Error</title>
+        <summary>incorrect id format</summary>
+        <author><name>arXiv api core</name></author>
+      </entry>
+    </feed>"""
+
+    parsed = parse_arxiv_atom(feed)
+
+    assert parsed.papers == []
+    assert len(parsed.errors) == 1
+    assert parsed.errors[0].message == "incorrect id format"

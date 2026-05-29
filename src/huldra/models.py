@@ -34,9 +34,28 @@ class QueueWorkKind(StrEnum):
     REFRESH_COMPLETED = "refresh_completed"
 
 
+class CoverageStatus(StrEnum):
+    SLICE = "slice"
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    OVERFLOW = "overflow"
+    UNKNOWN = "unknown"
+
+
+class LegacySyncMode(StrEnum):
+    SLICE = "slice"
+    COMPLETE_WINDOW = "complete_window"
+
+
+class OaiHarvestMode(StrEnum):
+    INITIAL = "initial"
+    INCREMENTAL = "incremental"
+
+
 SortBy = Literal["relevance", "lastUpdatedDate", "submittedDate"]
 SortOrder = Literal["ascending", "descending"]
-ApiFamily = Literal["legacy_search"]
+ApiFamily = Literal["legacy_search", "oai_pmh"]
+OaiMetadataPrefix = Literal["arXiv", "arXivRaw"]
 
 
 class HuldraModel(BaseModel):
@@ -70,6 +89,13 @@ class ArxivRequest(HuldraModel):
         value = value.strip()
         if not value:
             raise ValueError("client_id cannot be blank")
+        return value
+
+    @field_validator("api_family")
+    @classmethod
+    def _api_family_must_be_legacy_search(cls, value: ApiFamily) -> ApiFamily:
+        if value != "legacy_search":
+            raise ValueError("ArxivRequest only supports api_family='legacy_search'; use OaiHarvestRequest")
         return value
 
     @field_validator("submitted_start", "submitted_end")
@@ -128,8 +154,18 @@ class ArxivPaper(HuldraResponseModel):
     journal_ref: str | None = None
     doi: str | None = None
     raw_atom: dict[str, Any] = Field(default_factory=dict)
+    authors_detail: list[dict[str, Any]] = Field(default_factory=list)
+    license: str | None = None
+    oai_identifier: str | None = None
+    oai_datestamp: datetime | None = None
+    oai_set_specs: list[str] = Field(default_factory=list)
+    links: list[dict[str, Any]] = Field(default_factory=list)
+    versions: list[dict[str, Any]] = Field(default_factory=list)
+    withdrawn: bool = False
+    deleted: bool = False
+    raw_metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("published_at", "updated_at")
+    @field_validator("published_at", "updated_at", "oai_datestamp")
     @classmethod
     def _paper_datetime_to_utc(cls, value: datetime | None) -> datetime | None:
         if value is None:
@@ -178,6 +214,7 @@ class CacheEntry(HuldraModel):
     upstream_requests_total: int = 0
     result_count: int = 0
     total_results: int | None = None
+    coverage_status: CoverageStatus = CoverageStatus.UNKNOWN
     error_category: str | None = None
     error_message: str | None = None
 
@@ -210,6 +247,7 @@ class ArxivResult(HuldraResponseModel):
     papers_total: int = 0
     cached_papers_total: int = 0
     total_results: int | None = None
+    coverage_status: CoverageStatus = CoverageStatus.UNKNOWN
     cache_hit: bool = False
     stale: bool = False
     cache_readable: bool = False
@@ -234,6 +272,7 @@ class ArxivRawInspectionResult(HuldraResponseModel):
     papers: list[ArxivPaper] = Field(default_factory=list)
     papers_total: int = 0
     total_results: int | None = None
+    coverage_status: CoverageStatus = CoverageStatus.UNKNOWN
     cache_hit: bool = False
     cache_readable: bool = False
     cooldown_until: datetime | None = None
@@ -245,6 +284,7 @@ class ArxivRawInspectionResult(HuldraResponseModel):
 
 
 class HuldraMaintenanceRequestResult(HuldraResponseModel):
+    sync_job_id: str | None = None
     cache_key: str
     request_id: str | None = None
     search_query: str | None = None
@@ -252,6 +292,7 @@ class HuldraMaintenanceRequestResult(HuldraResponseModel):
     submitted_end: datetime | None = None
     raw_cache_status: str
     serving_status: str | None = None
+    coverage_status: CoverageStatus = CoverageStatus.UNKNOWN
     cache_hit: bool = False
     joined_existing_queue: bool = False
     upstream_status: int | None = None
@@ -259,6 +300,10 @@ class HuldraMaintenanceRequestResult(HuldraResponseModel):
     error_category: str | None = None
     error_message: str | None = None
     papers_total: int = 0
+    result_count: int = 0
+    total_results: int | None = None
+    pages_total: int = 0
+    pages_completed_total: int = 0
 
 
 class HuldraMaintenanceResult(HuldraResponseModel):
@@ -267,6 +312,10 @@ class HuldraMaintenanceResult(HuldraResponseModel):
     cache_miss_total: int = 0
     cache_hit_total: int = 0
     completed_windows_total: int = 0
+    completed_slices_total: int = 0
+    complete_windows_total: int = 0
+    partial_windows_total: int = 0
+    overflow_windows_total: int = 0
     upstream_requests_total: int = 0
     upstream_429_total: int = 0
     retry_after_seconds: int | None = None
@@ -284,6 +333,13 @@ class HuldraSyncRequest(HuldraModel):
     requests: list[ArxivRequest]
     wait: bool = False
     wait_timeout_seconds: float | None = Field(default=None, gt=0)
+    mode: LegacySyncMode = LegacySyncMode.SLICE
+
+    @model_validator(mode="after")
+    def _complete_window_requires_wait(self) -> HuldraSyncRequest:
+        if self.mode == LegacySyncMode.COMPLETE_WINDOW and not self.wait:
+            raise ValueError("complete_window mode requires wait=True")
+        return self
 
 
 class HuldraBackfillRequest(HuldraModel):
@@ -293,6 +349,7 @@ class HuldraBackfillRequest(HuldraModel):
     max_results: int = Field(default=50, ge=1, le=2000)
     wait: bool = False
     wait_timeout_seconds: float | None = Field(default=None, gt=0)
+    mode: LegacySyncMode = LegacySyncMode.SLICE
     client_id: str = "huldra-backfill"
 
     @field_validator("search_queries")
@@ -315,7 +372,72 @@ class HuldraBackfillRequest(HuldraModel):
     def _validate_backfill_dates(self) -> HuldraBackfillRequest:
         if self.start_date > self.end_date:
             raise ValueError("start_date must be on or before end_date")
+        if self.mode == LegacySyncMode.COMPLETE_WINDOW and not self.wait:
+            raise ValueError("complete_window mode requires wait=True")
         return self
+
+
+class OaiHarvestRequest(HuldraModel):
+    client_id: str = "huldra-oai"
+    metadata_prefix: OaiMetadataPrefix = "arXiv"
+    set_spec: str | None = None
+    from_datestamp: str | None = None
+    until_datestamp: str | None = None
+    resumption_token: str | None = None
+    mode: OaiHarvestMode = OaiHarvestMode.INCREMENTAL
+    cache_policy: CachePolicy = CachePolicy.CACHE_OR_ENQUEUE
+    priority: int = 0
+    timeout_seconds: float | None = Field(default=None, gt=0)
+
+    @field_validator("client_id")
+    @classmethod
+    def _oai_client_id_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("client_id cannot be blank")
+        return value
+
+    @field_validator("set_spec", "from_datestamp", "until_datestamp", "resumption_token")
+    @classmethod
+    def _oai_optional_string_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class OaiRecord(HuldraModel):
+    oai_identifier: str
+    arxiv_id: str | None = None
+    metadata_prefix: OaiMetadataPrefix
+    datestamp: datetime | None = None
+    set_specs: list[str] = Field(default_factory=list)
+    deleted: bool = False
+    paper: ArxivPaper | None = None
+    raw_xml: str | None = None
+
+    @field_validator("datestamp")
+    @classmethod
+    def _datestamp_to_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return ensure_utc(value)
+
+
+class OaiHarvestResult(HuldraResponseModel):
+    harvest_id: str
+    status: str
+    metadata_prefix: OaiMetadataPrefix
+    set_spec: str | None = None
+    mode: OaiHarvestMode
+    records_processed: int = 0
+    papers_upserted: int = 0
+    deleted_records: int = 0
+    pages_total: int = 0
+    current_watermark: str | None = None
+    resumption_token: str | None = None
+    error_category: str | None = None
+    error_message: str | None = None
 
 
 def utc_day_floor(value: datetime) -> datetime:

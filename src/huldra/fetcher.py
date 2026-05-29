@@ -21,8 +21,14 @@ class HuldraFetchError(RuntimeError):
 
 
 class RateLimitedError(HuldraFetchError):
-    def __init__(self, retry_after_seconds: int | None, message: str = "rate limited") -> None:
-        super().__init__(message, status_code=429)
+    def __init__(
+        self,
+        retry_after_seconds: int | None,
+        message: str = "rate limited",
+        *,
+        status_code: int = 429,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
         self.retry_after_seconds = retry_after_seconds
 
 
@@ -73,6 +79,12 @@ class ArxivApiFetcher:
                 status_code=response.status_code,
             )
         parsed = parse_arxiv_atom(response.text)
+        if parsed.errors:
+            message = parsed.errors[0].message or parsed.errors[0].title
+            raise NonRetryableFetchError(
+                f"arXiv API returned an error feed: {message}",
+                status_code=response.status_code,
+            )
         return FetchResult(
             papers=parsed.papers,
             total_results=parsed.total_results,

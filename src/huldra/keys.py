@@ -44,6 +44,10 @@ def arxiv_version(value: str) -> int | None:
     return int(match.group("version"))
 
 
+def arxiv_id_family_base(value: str) -> str:
+    return _VERSION_RE.sub("", normalize_arxiv_id(value))
+
+
 def request_fingerprint_payload(request: ArxivRequest) -> dict[str, Any]:
     return {
         "normalization_version": NORMALIZATION_VERSION,

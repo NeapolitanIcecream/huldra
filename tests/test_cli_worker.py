@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,12 @@ from typer.testing import CliRunner
 
 import huldra.cli as cli
 from huldra.worker import WorkerPassResult
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(value: str) -> str:
+    return _ANSI_RE.sub("", value)
 
 
 def test_store_status_and_worker_once_cli(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -114,3 +121,24 @@ def test_sync_and_backfill_cli_emit_json_summaries(tmp_path: Path) -> None:
     assert json.loads(sync.output)["requested_total"] == 1
     assert backfill.exit_code == 0
     assert json.loads(backfill.output)["requested_total"] == 2
+
+
+def test_complete_window_cli_requires_wait(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sync",
+            "--db",
+            str(tmp_path / "huldra.db"),
+            "--search-query",
+            "cat:cs.AI",
+            "--date",
+            "2026-01-01",
+            "--mode",
+            "complete-window",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code != 0
+    assert "requires --wait" in _strip_ansi(result.output)

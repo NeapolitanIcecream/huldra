@@ -3,15 +3,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
+import httpx
+
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import FetchResult, RateLimitedError, TransientFetchError
+from huldra.fetcher import ArxivApiFetcher, FetchResult, RateLimitedError, TransientFetchError
 from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, CachePolicy, QueueWorkKind
 from huldra.time import utc_now
 from huldra.worker import HuldraWorker
 from tests.conftest import make_paper
+
+ERROR_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/api/errors</id>
+    <link href="http://arxiv.org/api/errors" rel="alternate"/>
+    <title>Error</title>
+    <summary>incorrect id format</summary>
+    <author><name>arXiv api core</name></author>
+  </entry>
+</feed>"""
 
 
 @dataclass
@@ -50,6 +63,30 @@ def test_worker_successfully_processes_queued_item(
     assert fetcher.calls == 1
     assert store.get_cache_entry(result.cache_key or "") is not None
     assert store.status_summary().papers_total == 1
+
+
+def test_worker_records_atom_error_feed_failure_without_api_errors_paper(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = ArxivRequest(client_id="demo", id_list=("bad id",))
+    store.enqueue_request(request)
+    fetcher = ArxivApiFetcher(
+        settings,
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, text=ERROR_FEED))
+        ),
+    )
+
+    result = HuldraWorker(store, settings, fetcher=fetcher, sleep=lambda _: None).run_once()
+    entry = store.get_cache_entry(result.cache_key or "")
+
+    assert result.status == "failed"
+    assert entry is not None
+    assert entry.status == "failed"
+    assert entry.error_category == "non_retryable"
+    assert store.get_paper("api/errors") is None
+    assert store.status_summary().papers_total == 0
 
 
 def test_worker_429_persists_cooldown_and_does_not_continue(
