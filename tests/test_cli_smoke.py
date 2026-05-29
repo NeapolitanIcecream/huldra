@@ -12,4 +12,4 @@ def test_cli_help_and_version() -> None:
     assert help_result.exit_code == 0
     assert "local arXiv metadata broker" in help_result.output
     assert version_result.exit_code == 0
-    assert "huldra 0.1.0" in version_result.output
+    assert "huldra 0.2.0" in version_result.output

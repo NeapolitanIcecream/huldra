@@ -1,6 +1,6 @@
 [project]
 name = "huldra-arxiv"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first arXiv metadata broker with shared cache, queue, and durable rate limiting."
 readme = "README.md"
 requires-python = ">=3.13"
