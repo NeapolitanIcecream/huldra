@@ -313,17 +313,28 @@ class HuldraStore:
     def get_papers_by_ids(self, arxiv_ids: list[str] | tuple[str, ...]) -> dict[str, ArxivPaper]:
         if not arxiv_ids:
             return {}
-        placeholders = ",".join("?" for _ in arxiv_ids)
+        requested_ids = tuple(dict.fromkeys(arxiv_ids))
+        placeholders = ",".join("?" for _ in requested_ids)
         with self.connect() as conn:
             rows = conn.execute(
                 f"SELECT * FROM papers WHERE arxiv_id IN ({placeholders})",
-                tuple(arxiv_ids),
+                requested_ids,
             ).fetchall()
-        return {row["arxiv_id"]: _paper_from_row(row) for row in rows}
+            rows_by_id = {row["arxiv_id"]: row for row in rows}
+            papers_by_requested_id: dict[str, ArxivPaper] = {}
+            for arxiv_id in requested_ids:
+                row = rows_by_id.get(arxiv_id)
+                if row is None:
+                    row = _oai_base_paper_row_for_versioned_read(conn, arxiv_id)
+                if row is not None:
+                    papers_by_requested_id[arxiv_id] = _paper_from_row(row)
+        return papers_by_requested_id
 
     def get_paper(self, arxiv_id: str) -> ArxivPaper | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()
+            if row is None:
+                row = _oai_base_paper_row_for_versioned_read(conn, arxiv_id)
         return _paper_from_row(row) if row else None
 
     def mark_paper_deleted(
@@ -1668,6 +1679,22 @@ def _legacy_paper_for_existing_oai_base_row(
             "canonical_url": f"https://arxiv.org/abs/{base_id}",
         }
     )
+
+
+def _oai_base_paper_row_for_versioned_read(conn: sqlite3.Connection, arxiv_id: str) -> sqlite3.Row | None:
+    if arxiv_version(arxiv_id) is None:
+        return None
+    base_id = arxiv_id_family_base(arxiv_id)
+    if base_id == arxiv_id:
+        return None
+    return conn.execute(
+        """
+        SELECT * FROM papers
+        WHERE arxiv_id = ?
+          AND oai_identifier IS NOT NULL
+        """,
+        (base_id,),
+    ).fetchone()
 
 
 def _version_family_merge_preference(arxiv_id: str) -> tuple[int, str]:

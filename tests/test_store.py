@@ -270,12 +270,13 @@ def test_legacy_versioned_cache_write_merges_into_existing_oai_base_row(
     )
 
     paper = store.get_paper("2401.00005")
-    duplicate = store.get_paper("2401.00005v1")
+    alias = store.get_paper("2401.00005v1")
     cached_papers = store.get_cached_papers(key)
     with store.connect() as conn:
         family_count = conn.execute(
             "SELECT COUNT(*) FROM papers WHERE arxiv_id IN ('2401.00005', '2401.00005v1')"
         ).fetchone()[0]
+        versioned_row = conn.execute("SELECT arxiv_id FROM papers WHERE arxiv_id = '2401.00005v1'").fetchone()
         cache_match = conn.execute(
             "SELECT arxiv_id FROM cache_matches WHERE cache_key = ?",
             (key,),
@@ -288,7 +289,9 @@ def test_legacy_versioned_cache_write_merges_into_existing_oai_base_row(
     assert paper.oai_identifier == "oai:arXiv.org:2401.00005"
     assert paper.oai_datestamp == datestamp
     assert paper.oai_set_specs == ["cs:cs:AI"]
-    assert duplicate is None
+    assert alias is not None
+    assert alias.arxiv_id == "2401.00005"
+    assert versioned_row is None
     assert family_count == 1
     assert cache_match["arxiv_id"] == "2401.00005"
     assert [cached.arxiv_id for cached in cached_papers] == ["2401.00005"]
@@ -335,7 +338,9 @@ def test_legacy_versioned_upsert_preserves_existing_oai_base_tombstone(
     store.upsert_papers([legacy_refresh])
 
     paper = store.get_paper("2401.00006")
-    duplicate = store.get_paper("2401.00006v1")
+    alias = store.get_paper("2401.00006v1")
+    with store.connect() as conn:
+        versioned_row = conn.execute("SELECT arxiv_id FROM papers WHERE arxiv_id = '2401.00006v1'").fetchone()
 
     assert paper is not None
     assert paper.arxiv_id == "2401.00006"
@@ -344,7 +349,9 @@ def test_legacy_versioned_upsert_preserves_existing_oai_base_tombstone(
     assert paper.oai_identifier == "oai:arXiv.org:2401.00006"
     assert paper.oai_datestamp == datestamp
     assert paper.oai_set_specs == ["cs:cs:AI"]
-    assert duplicate is None
+    assert alias is not None
+    assert alias.arxiv_id == "2401.00006"
+    assert versioned_row is None
 
 
 def test_legacy_versioned_upsert_keeps_legacy_only_family_rows_distinct(
@@ -358,6 +365,71 @@ def test_legacy_versioned_upsert_keeps_legacy_only_family_rows_distinct(
 
     assert store.get_paper("2401.00007") is not None
     assert store.get_paper("2401.00007v1") is not None
+
+
+def test_versioned_read_resolves_to_oai_base_row(
+    store: HuldraStore,
+) -> None:
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    oai_paper = make_paper("2401.00008").model_copy(
+        update={
+            "version": None,
+            "title": "OAI Base",
+            "oai_identifier": "oai:arXiv.org:2401.00008",
+            "oai_datestamp": datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00008",
+                arxiv_id="2401.00008",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                paper=oai_paper,
+            )
+        ]
+    )
+
+    paper = store.get_paper("2401.00008v1")
+    papers_by_id = store.get_papers_by_ids(("2401.00008v1",))
+
+    assert paper is not None
+    assert paper.arxiv_id == "2401.00008"
+    assert paper.title == "OAI Base"
+    assert papers_by_id["2401.00008v1"].arxiv_id == "2401.00008"
+
+
+def test_versioned_read_prefers_exact_row_over_oai_base_alias(
+    store: HuldraStore,
+) -> None:
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    base_paper = make_paper("2401.00009").model_copy(update={"version": None, "title": "OAI Base"})
+    versioned_paper = make_paper("2401.00009v1").model_copy(update={"title": "Exact Version"})
+
+    store.upsert_papers([base_paper, versioned_paper])
+    with store.begin_immediate() as conn:
+        conn.execute(
+            """
+            UPDATE papers
+            SET oai_identifier=?,
+                oai_datestamp=?,
+                oai_set_specs_json=?
+            WHERE arxiv_id=?
+            """,
+            ("oai:arXiv.org:2401.00009", datestamp.isoformat(), '["cs:cs:AI"]', "2401.00009"),
+        )
+
+    paper = store.get_paper("2401.00009v1")
+    papers_by_id = store.get_papers_by_ids(("2401.00009v1",))
+
+    assert paper is not None
+    assert paper.arxiv_id == "2401.00009v1"
+    assert paper.title == "Exact Version"
+    assert papers_by_id["2401.00009v1"].arxiv_id == "2401.00009v1"
 
 
 def test_enqueue_dedupes_pending_cache_key(store: HuldraStore) -> None:

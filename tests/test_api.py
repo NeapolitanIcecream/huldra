@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -8,7 +8,7 @@ from huldra.api import create_app
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
-from huldra.models import ArxivRequest, RateState
+from huldra.models import ArxivRequest, OaiRecord, RateState
 from huldra.oai import OaiPmhPage
 from huldra.time import utc_now
 from tests.conftest import make_paper
@@ -93,6 +93,41 @@ def test_api_get_paper_supports_old_style_arxiv_id_with_slash(
     encoded = client.get("/v1/papers/hep-th%2F9901001v1")
     assert encoded.status_code == 200
     assert encoded.json()["arxiv_id"] == "hep-th/9901001v1"
+
+
+def test_api_get_paper_serves_versioned_alias_from_oai_base_row(
+    settings: HuldraSettings,
+) -> None:
+    store = HuldraStore(settings.db_path)
+    store.init_schema()
+    datestamp = datetime(2026, 5, 28, tzinfo=UTC)
+    oai_paper = make_paper("2401.00008").model_copy(
+        update={
+            "version": None,
+            "title": "OAI Base",
+            "oai_identifier": "oai:arXiv.org:2401.00008",
+            "oai_datestamp": datestamp,
+            "oai_set_specs": ["cs:cs:AI"],
+        }
+    )
+    store.upsert_oai_records(
+        [
+            OaiRecord(
+                oai_identifier="oai:arXiv.org:2401.00008",
+                arxiv_id="2401.00008",
+                metadata_prefix="arXiv",
+                datestamp=datestamp,
+                set_specs=["cs:cs:AI"],
+                paper=oai_paper,
+            )
+        ]
+    )
+
+    response = TestClient(create_app(settings)).get("/v1/papers/2401.00008v1")
+
+    assert response.status_code == 200
+    assert response.json()["arxiv_id"] == "2401.00008"
+    assert response.json()["title"] == "OAI Base"
 
 
 def test_api_serializes_cooldown_status(settings: HuldraSettings) -> None:
