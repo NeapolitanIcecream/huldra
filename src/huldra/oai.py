@@ -175,6 +175,8 @@ def parse_oai_pmh_list_records(
     ]
     list_records = root.find(f"{{{OAI_NS}}}ListRecords")
     if list_records is None:
+        if not errors:
+            raise ValueError("OAI response missing ListRecords")
         return OaiPmhPage(
             records=[],
             response_date=response_date,

@@ -112,6 +112,17 @@ OAI_ERROR = """<?xml version="1.0" encoding="UTF-8"?>
   <error code="badArgument">bad from value</error>
 </OAI-PMH>"""
 
+OAI_NO_RECORDS_MATCH = """<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-05-28T00:00:00Z</responseDate>
+  <error code="noRecordsMatch">no records found</error>
+</OAI-PMH>"""
+
+WELL_FORMED_NON_OAI_BODY = """<?xml version="1.0" encoding="UTF-8"?>
+<html>
+  <body>temporarily unavailable</body>
+</html>"""
+
 OAI_MALFORMED_RECORD_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
 <OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
   <responseDate>2026-05-28T00:00:00Z</responseDate>
@@ -259,6 +270,7 @@ def test_oai_parser_handles_arxiv_record_deleted_header_error_and_token() -> Non
     page = parse_oai_pmh_list_records(OAI_PAGE)
     deleted = parse_oai_pmh_list_records(OAI_DELETED_PAGE)
     error = parse_oai_pmh_list_records(OAI_ERROR)
+    empty = parse_oai_pmh_list_records(OAI_NO_RECORDS_MATCH)
 
     assert page.response_date == "2026-05-28T00:00:00Z"
     assert page.resumption_token == "next-token"
@@ -270,6 +282,13 @@ def test_oai_parser_handles_arxiv_record_deleted_header_error_and_token() -> Non
     assert deleted.records[0].deleted
     assert deleted.records[0].arxiv_id == "2401.00002"
     assert error.errors[0].code == "badArgument"
+    assert empty.records == []
+    assert empty.errors[0].code == "noRecordsMatch"
+
+
+def test_oai_parser_rejects_missing_list_records_without_oai_error() -> None:
+    with pytest.raises(ValueError, match="missing ListRecords"):
+        parse_oai_pmh_list_records(WELL_FORMED_NON_OAI_BODY)
 
 
 def test_oai_parser_handles_arxiv_raw_record_versions_and_metadata() -> None:
@@ -349,6 +368,22 @@ def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
 
     assert exc.value.status_code == 200
     assert "malformed XML" in str(exc.value)
+
+
+def test_oai_fetcher_well_formed_non_oai_200_raises_transient_fetch_error(
+    settings: HuldraSettings,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text=WELL_FORMED_NON_OAI_BODY)
+        )
+    )
+
+    with pytest.raises(TransientFetchError) as exc:
+        OaiPmhFetcher(settings, client=client).list_records(metadata_prefix="arXiv")
+
+    assert exc.value.status_code == 200
+    assert "missing ListRecords" in str(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -498,6 +533,50 @@ def test_oai_harvest_malformed_200_records_failure_and_releases_limiter(
     assert job["status"] == "transient_failure"
     assert job["error_category"] == "transient"
     assert store.acquire_lease("upstream_fetch", "probe", 60)
+
+
+def test_oai_harvest_well_formed_non_oai_200_records_failure_and_preserves_watermark(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    store.set_oai_watermark(
+        metadata_prefix="arXiv",
+        set_spec=None,
+        last_response_date="2026-05-28T00:00:00Z",
+        last_datestamp_seen="2026-05-27T00:00:00+00:00",
+        harvest_id="previous",
+    )
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text=WELL_FORMED_NON_OAI_BODY)
+        )
+    )
+    broker = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=OaiPmhFetcher(settings, client=client),
+    )
+
+    result = broker.harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INCREMENTAL)
+    )
+
+    watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
+    with store.connect() as conn:
+        page = conn.execute("SELECT status, error_category FROM oai_pages").fetchone()
+        job = conn.execute("SELECT status, error_category FROM oai_harvest_jobs").fetchone()
+    assert result.status == "transient_failure"
+    assert result.error_category == "transient"
+    assert page is not None
+    assert page["status"] == "transient_failure"
+    assert page["error_category"] == "transient"
+    assert job is not None
+    assert job["status"] == "transient_failure"
+    assert job["error_category"] == "transient"
+    assert watermark is not None
+    assert watermark["last_response_date"] == "2026-05-28T00:00:00Z"
+    assert watermark["last_datestamp_seen"] == "2026-05-27T00:00:00+00:00"
+    assert watermark["last_successful_harvest_id"] == "previous"
 
 
 @pytest.mark.parametrize(
