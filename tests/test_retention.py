@@ -34,6 +34,30 @@ def _queue_request(store: HuldraStore, suffix: str) -> QueueItem:
     return store.enqueue_request(ArxivRequest(client_id="gc-test", search_query=f"cat:{suffix}"))
 
 
+def _queue_async_sync_job(
+    store: HuldraStore,
+    request: ArxivRequest,
+) -> tuple[QueueItem, str]:
+    queued = store.enqueue_request(request)
+    sync_job_id = store.create_sync_job(request, LegacySyncMode.SLICE)
+    store.record_sync_job_page(
+        sync_job_id=sync_job_id,
+        request=request,
+        cache_key=queued.cache_key,
+        status="queued",
+    )
+    store.complete_sync_job(
+        sync_job_id=sync_job_id,
+        status="queued",
+        coverage_status=CoverageStatus.UNKNOWN,
+        result_count=0,
+        total_results=None,
+        pages_total=1,
+        pages_completed_total=0,
+    )
+    return queued, sync_job_id
+
+
 def _finish_queue_work(
     store: HuldraStore,
     item: QueueItem,
@@ -221,23 +245,7 @@ def test_retention_gc_reclaims_expired_async_job_after_associated_work_finishes(
     assert old is not None
 
     request = ArxivRequest(client_id="gc-test", search_query="cat:async")
-    queued = store.enqueue_request(request)
-    sync_job_id = store.create_sync_job(request, LegacySyncMode.SLICE)
-    store.record_sync_job_page(
-        sync_job_id=sync_job_id,
-        request=request,
-        cache_key=queued.cache_key,
-        status="queued",
-    )
-    store.complete_sync_job(
-        sync_job_id=sync_job_id,
-        status="queued",
-        coverage_status=CoverageStatus.UNKNOWN,
-        result_count=0,
-        total_results=None,
-        pages_total=1,
-        pages_completed_total=0,
-    )
+    queued, sync_job_id = _queue_async_sync_job(store, request)
     _age_sync_job(store, sync_job_id, timestamp=old)
 
     active_preview = store.gc(cutoff=cutoff)
@@ -278,6 +286,53 @@ def test_retention_gc_reclaims_expired_async_job_after_associated_work_finishes(
     assert store.get_sync_job(sync_job_id) is None
     assert store.get_queue_item(queued.request_id) is None
     assert store.get_cache_entry(queued.cache_key) is not None
+
+
+def test_retention_gc_preserves_async_job_with_recent_terminal_outcome(
+    store: HuldraStore,
+) -> None:
+    now = utc_now()
+    cutoff = now - timedelta(days=30)
+    old_at = now - timedelta(days=60)
+    old = isoformat_or_none(old_at)
+    assert old is not None
+
+    request = ArxivRequest(client_id="gc-test", search_query="cat:mixed-age")
+    queued, sync_job_id = _queue_async_sync_job(store, request)
+    _age_sync_job(store, sync_job_id, timestamp=old)
+    _finish_queue_work(
+        store,
+        queued,
+        request,
+        status=RequestStatus.COMPLETED,
+        timestamp=old_at,
+    )
+    _finish_queue_work(
+        store,
+        queued,
+        request,
+        status=RequestStatus.FAILED,
+        timestamp=now,
+    )
+
+    recent_outcome_preview = store.gc(cutoff=cutoff)
+
+    assert recent_outcome_preview.sync_jobs_eligible_total == 0
+    assert recent_outcome_preview.sync_job_pages_eligible_total == 0
+    assert store.get_sync_job(sync_job_id) is not None
+
+    _finish_queue_work(
+        store,
+        queued,
+        request,
+        status=RequestStatus.FAILED,
+        timestamp=old_at,
+    )
+
+    expired_outcomes_preview = store.gc(cutoff=cutoff)
+
+    assert expired_outcomes_preview.sync_jobs_eligible_total == 1
+    assert expired_outcomes_preview.sync_job_pages_eligible_total == 1
 
 
 def test_store_gc_cli_defaults_to_dry_run(tmp_path: Path) -> None:

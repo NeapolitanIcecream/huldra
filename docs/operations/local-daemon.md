@@ -221,12 +221,12 @@ uv run huldra store gc \
 
 Retention deletes old `events`, queue items in `completed` or `failed` state,
 and sync jobs in an explicit terminal-state allowlist. An expired async sync
-job handed off as queued, delayed, or claimed also becomes eligible after every
-associated page has a completed or failed cache/queue outcome older than the
-same cutoff and none has active queue work. Deleting an eligible sync job also
-deletes its `sync_job_pages`. Active queue items and their handed-off sync jobs
-are preserved; leases are never touched. Cached papers, cache entries, OAI
-harvest state, and OAI watermarks are outside this command's scope.
+job handed off as queued, delayed, or claimed also becomes eligible after all
+cache/queue records associated with every page are completed or failed and
+older than the same cutoff. Active or recent work keeps the job ineligible.
+Deleting an eligible sync job also deletes its `sync_job_pages`; leases are
+never touched. Cached papers, cache entries, OAI harvest state, and OAI
+watermarks are outside this command's scope.
 
 SQLite reuses pages freed by deletion, but the database file normally does not
 shrink immediately. If physical file size must decrease, stop the API and

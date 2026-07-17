@@ -49,7 +49,7 @@ _RETENTION_TABLES = frozenset(
     {"cache_entries", "events", "queue_items", "sync_jobs", "sync_job_pages"}
 )
 # Async maintenance sets completed_at when handing work to a worker. Reclaim
-# that job only after every associated page is old and terminal.
+# that job only after all work records for every page are old and terminal.
 _RETENTION_SYNC_JOB_FILTER = f"""
     job.completed_at IS NOT NULL
     AND job.completed_at < ?
@@ -69,10 +69,32 @@ _RETENTION_SYNC_JOB_FILTER = f"""
                   AND (
                       EXISTS (
                           SELECT 1
-                          FROM queue_items AS active_queue
-                          WHERE active_queue.cache_key = page.cache_key
-                            AND active_queue.status IN (
-                                {_ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS}
+                          FROM cache_entries AS non_expired_cache
+                          WHERE non_expired_cache.cache_key = page.cache_key
+                            AND (
+                                non_expired_cache.status NOT IN ('completed', 'failed')
+                                OR COALESCE(
+                                    CASE non_expired_cache.status
+                                        WHEN 'completed' THEN non_expired_cache.completed_at
+                                        WHEN 'failed' THEN non_expired_cache.requested_at
+                                    END >= ?,
+                                    1
+                                )
+                            )
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM queue_items AS non_expired_queue
+                          WHERE non_expired_queue.cache_key = page.cache_key
+                            AND (
+                                non_expired_queue.status NOT IN ('completed', 'failed')
+                                OR COALESCE(
+                                    CASE non_expired_queue.status
+                                        WHEN 'completed' THEN non_expired_queue.completed_at
+                                        WHEN 'failed' THEN non_expired_queue.updated_at
+                                    END >= ?,
+                                    1
+                                )
                             )
                       )
                       OR (
@@ -109,7 +131,8 @@ def _retention_sync_job_params(cutoff: str) -> tuple[str, ...]:
         cutoff,
         *_TERMINAL_SYNC_JOB_STATUSES,
         *_ASYNC_SYNC_JOB_HANDOFF_STATUSES,
-        *_ASYNC_SYNC_JOB_HANDOFF_STATUSES,
+        cutoff,
+        cutoff,
         cutoff,
         cutoff,
     )
