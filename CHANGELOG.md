@@ -24,6 +24,9 @@
   useful work.
 - Made retention previews read-only so they do not create or migrate a target
   database.
+- Reclaimed expired async sync/backfill jobs after all associated queue/cache
+  work ages past the retention cutoff, while preserving jobs with active or
+  recent work.
 
 ## 0.2.0 - 2026-05-29
 

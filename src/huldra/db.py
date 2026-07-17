@@ -41,7 +41,78 @@ _TERMINAL_SYNC_JOB_STATUSES = (
     "overflow",
 )
 _TERMINAL_SYNC_JOB_PLACEHOLDERS = ",".join("?" for _ in _TERMINAL_SYNC_JOB_STATUSES)
-_RETENTION_TABLES = frozenset({"events", "queue_items", "sync_jobs", "sync_job_pages"})
+_ASYNC_SYNC_JOB_HANDOFF_STATUSES = ("queued", "delayed", "claimed")
+_ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS = ",".join(
+    "?" for _ in _ASYNC_SYNC_JOB_HANDOFF_STATUSES
+)
+_RETENTION_TABLES = frozenset(
+    {"cache_entries", "events", "queue_items", "sync_jobs", "sync_job_pages"}
+)
+# Async maintenance sets completed_at when handing work to a worker. Reclaim
+# that job only after every associated page is old and terminal.
+_RETENTION_SYNC_JOB_FILTER = f"""
+    job.completed_at IS NOT NULL
+    AND job.completed_at < ?
+    AND (
+        job.status IN ({_TERMINAL_SYNC_JOB_PLACEHOLDERS})
+        OR (
+            job.status IN ({_ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS})
+            AND EXISTS (
+                SELECT 1
+                FROM sync_job_pages AS page
+                WHERE page.sync_job_id = job.sync_job_id
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM sync_job_pages AS page
+                WHERE page.sync_job_id = job.sync_job_id
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM queue_items AS active_queue
+                          WHERE active_queue.cache_key = page.cache_key
+                            AND active_queue.status IN (
+                                {_ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS}
+                            )
+                      )
+                      OR (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM cache_entries AS terminal_cache
+                              WHERE terminal_cache.cache_key = page.cache_key
+                                AND terminal_cache.status IN ('completed', 'failed')
+                                AND CASE terminal_cache.status
+                                    WHEN 'completed' THEN terminal_cache.completed_at
+                                    WHEN 'failed' THEN terminal_cache.requested_at
+                                END < ?
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM queue_items AS terminal_queue
+                              WHERE terminal_queue.cache_key = page.cache_key
+                                AND terminal_queue.status IN ('completed', 'failed')
+                                AND CASE terminal_queue.status
+                                    WHEN 'completed' THEN terminal_queue.completed_at
+                                    WHEN 'failed' THEN terminal_queue.updated_at
+                                END < ?
+                          )
+                      )
+                  )
+            )
+        )
+    )
+"""
+
+
+def _retention_sync_job_params(cutoff: str) -> tuple[str, ...]:
+    return (
+        cutoff,
+        *_TERMINAL_SYNC_JOB_STATUSES,
+        *_ASYNC_SYNC_JOB_HANDOFF_STATUSES,
+        *_ASYNC_SYNC_JOB_HANDOFF_STATUSES,
+        cutoff,
+        cutoff,
+    )
 
 
 class HuldraStore:
@@ -1628,6 +1699,17 @@ class HuldraStore:
                 "DELETE FROM events WHERE created_at < ?",
                 (cutoff_s,),
             ).rowcount
+            sync_jobs_deleted = conn.execute(
+                f"""
+                DELETE FROM sync_jobs
+                WHERE sync_job_id IN (
+                    SELECT job.sync_job_id
+                    FROM sync_jobs AS job
+                    WHERE {_RETENTION_SYNC_JOB_FILTER}
+                )
+                """,
+                _retention_sync_job_params(cutoff_s),
+            ).rowcount
             queue_items_deleted = conn.execute(
                 """
                 DELETE FROM queue_items
@@ -1635,15 +1717,6 @@ class HuldraStore:
                    OR (status = 'failed' AND updated_at < ?)
                 """,
                 (cutoff_s, cutoff_s),
-            ).rowcount
-            sync_jobs_deleted = conn.execute(
-                f"""
-                DELETE FROM sync_jobs
-                WHERE status IN ({_TERMINAL_SYNC_JOB_PLACEHOLDERS})
-                  AND completed_at IS NOT NULL
-                  AND completed_at < ?
-                """,
-                (*_TERMINAL_SYNC_JOB_STATUSES, cutoff_s),
             ).rowcount
 
         deleted = (
@@ -1699,6 +1772,11 @@ class HuldraStore:
     ) -> tuple[int, int, int, int]:
         row = conn.execute(
             f"""
+            WITH eligible_sync_jobs AS (
+                SELECT job.sync_job_id
+                FROM sync_jobs AS job
+                WHERE {_RETENTION_SYNC_JOB_FILTER}
+            )
             SELECT
                 (SELECT COUNT(*) FROM events WHERE created_at < ?) AS events,
                 (
@@ -1709,27 +1787,19 @@ class HuldraStore:
                 ) AS queue_items,
                 (
                     SELECT COUNT(*)
-                    FROM sync_jobs
-                    WHERE status IN ({_TERMINAL_SYNC_JOB_PLACEHOLDERS})
-                      AND completed_at IS NOT NULL
-                      AND completed_at < ?
+                    FROM eligible_sync_jobs
                 ) AS sync_jobs,
                 (
                     SELECT COUNT(*)
                     FROM sync_job_pages AS page
-                    JOIN sync_jobs AS job ON job.sync_job_id = page.sync_job_id
-                    WHERE job.status IN ({_TERMINAL_SYNC_JOB_PLACEHOLDERS})
-                      AND job.completed_at IS NOT NULL
-                      AND job.completed_at < ?
+                    JOIN eligible_sync_jobs AS job
+                      ON job.sync_job_id = page.sync_job_id
                 ) AS sync_job_pages
             """,
             (
+                *_retention_sync_job_params(cutoff),
                 cutoff,
                 cutoff,
-                cutoff,
-                *_TERMINAL_SYNC_JOB_STATUSES,
-                cutoff,
-                *_TERMINAL_SYNC_JOB_STATUSES,
                 cutoff,
             ),
         ).fetchone()
