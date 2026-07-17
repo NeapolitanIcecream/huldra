@@ -266,7 +266,7 @@ def test_worker_transient_failure_returns_retry_wake_time(
     assert queued.next_attempt_at == result.cooldown_until
 
 
-def test_worker_cache_hit_records_completion(
+def test_worker_cache_hit_updates_completion_state_without_pass_events(
     store: HuldraStore,
     settings: HuldraSettings,
 ) -> None:
@@ -278,6 +278,7 @@ def test_worker_cache_hit_records_completion(
         papers=[make_paper()],
     )
     store.enqueue_request(request, key)
+    events_before = store.status_summary().events_total
 
     result = HuldraWorker(
         store,
@@ -288,4 +289,19 @@ def test_worker_cache_hit_records_completion(
 
     assert result.status == "cache_hit"
     assert store.status_summary().worker_last_heartbeat_at is not None
-    assert "worker_stop" in {event["event_type"] for event in store.events()}
+    assert store.status_summary().events_total == events_before
+
+
+def test_idle_worker_pass_updates_state_without_persisting_pass_events(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    events_before = store.status_summary().events_total
+
+    result = HuldraWorker(store, settings, fetcher=FakeFetcher([])).run_once()
+
+    assert result.status == "idle"
+    status = store.status_summary()
+    assert status.worker_last_heartbeat_at is not None
+    assert status.worker_next_wake_at is not None
+    assert status.events_total == events_before

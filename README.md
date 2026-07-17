@@ -55,6 +55,11 @@ Run a foreground worker in a separate terminal:
 uv run huldra worker --db ~/.local/share/huldra/huldra.db --poll-interval-seconds 300 --json
 ```
 
+Idle worker passes are silent by default. Worker `--json` output is compact
+JSON Lines (one non-idle pass per line), which is safe to stream to a
+supervisor or parser. Add `--emit-idle` only for short-lived debugging. The
+poll interval defaults to 300 seconds and cannot be set below 1 second.
+
 Check status:
 
 ```bash
@@ -62,7 +67,22 @@ uv run huldra status --db ~/.local/share/huldra/huldra.db --json
 ```
 
 Status includes queue depth, cache totals, durable upstream 429 totals,
-cooldown state, worker heartbeat, worker next wake, and the last worker error.
+cooldown state, worker heartbeat, worker next wake, the last worker error, and
+row counts for events, queue history, sync jobs, and sync-job pages.
+
+Preview retention cleanup without deleting anything:
+
+```bash
+uv run huldra store gc --db ~/.local/share/huldra/huldra.db --older-than-days 30 --json
+```
+
+The store must already exist and be initialized; a dry run does not create or
+migrate a database. After reviewing the preview, repeat it with `--apply`.
+Cleanup removes only old events and explicitly terminal queue and sync records.
+It preserves pending, delayed, claimed, running, and leased work, and does not
+delete cached papers or cache entries. See
+[the local operations guide](docs/operations/local-daemon.md#backup-and-retention)
+for deletion and SQLite file-size details.
 
 The API binds to `127.0.0.1` by default. Do not expose it to a public network
 without a reverse proxy and authentication.

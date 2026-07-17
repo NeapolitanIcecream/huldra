@@ -20,7 +20,7 @@ def _strip_ansi(value: str) -> str:
     return _ANSI_RE.sub("", value)
 
 
-def test_store_status_and_worker_once_cli(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_worker_once_suppresses_idle_output_by_default(tmp_path) -> None:  # type: ignore[no-untyped-def]
     db = tmp_path / "huldra.db"
     runner = CliRunner()
     init = runner.invoke(cli.app, ["store", "init", "--db", str(db)])
@@ -30,10 +30,29 @@ def test_store_status_and_worker_once_cli(tmp_path) -> None:  # type: ignore[no-
     assert status.exit_code == 0
     assert worker.exit_code == 0
     assert json.loads(status.output)["queue_depth_total"] == 0
-    assert json.loads(worker.output)["status"] == "idle"
+    assert worker.output == ""
 
 
-def test_worker_cli_does_not_sleep_between_successful_passes(
+def test_worker_once_emit_idle_outputs_one_compact_json_line(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "worker",
+            "--db",
+            str(tmp_path / "huldra.db"),
+            "--once",
+            "--json",
+            "--emit-idle",
+        ],
+    )
+
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["status"] == "idle"
+
+
+def test_worker_cli_emits_compact_json_only_for_non_idle_passes(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -70,14 +89,32 @@ def test_worker_cli_does_not_sleep_between_successful_passes(
             str(tmp_path / "huldra.db"),
             "--poll-interval-seconds",
             "7",
+            "--json",
         ],
     )
 
     assert result.exit_code == 0
-    assert result.output.count("'status': 'completed'") == 1
-    assert result.output.count("'status': 'cache_hit'") == 1
-    assert result.output.count("'status': 'idle'") == 1
+    payloads = [json.loads(line) for line in result.output.splitlines()]
+    assert [payload["status"] for payload in payloads] == ["completed", "cache_hit"]
     assert sleep_calls == [7.0]
+
+
+def test_worker_cli_rejects_poll_intervals_below_one_second(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "worker",
+            "--db",
+            str(tmp_path / "huldra.db"),
+            "--once",
+            "--poll-interval-seconds",
+            "0",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code != 0
+    assert "x>=1.0" in _strip_ansi(result.output)
 
 
 def test_sync_and_backfill_cli_emit_json_summaries(tmp_path: Path) -> None:

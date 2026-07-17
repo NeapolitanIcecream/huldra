@@ -22,7 +22,16 @@ uv run huldra status --db ~/.local/share/huldra/huldra.db --json
 ```
 
 The status payload shows `cooldown_until` and `cooldown_active` so supervisors
-can tell when arXiv returned HTTP 429 and the worker is waiting.
+can tell when arXiv returned HTTP 429 and the worker is waiting. It also reports
+`events_total`, `queue_items_total`, `queue_terminal_total`, `sync_jobs_total`,
+`sync_jobs_terminal_total`, and `sync_job_pages_total` without returning the
+underlying event or workflow rows.
+
+Idle worker passes are silent by default. With `--json`, each non-idle pass is
+one compact JSON line. Use `--emit-idle` only when debugging a short run; a
+continuously supervised worker can otherwise produce a large stdout log even
+when it has no work. The idle poll interval defaults to 300 seconds and has a
+minimum of 1 second.
 
 ## Sync And Backfill Jobs
 
@@ -128,8 +137,18 @@ WantedBy=default.target
 
 ## launchd
 
-Use one plist for the API and one for the worker. Keep `RunAtLoad` enabled and
-set `KeepAlive` to true.
+Use one plist for the API and one for the worker. Before loading it, confirm
+that no other service owns the API port and that only one supervisor owns each
+Huldra process:
+
+```bash
+lsof -nP -iTCP:8765 -sTCP:LISTEN
+curl --fail http://127.0.0.1:8765/v1/status
+```
+
+If the port already serves a healthy Huldra instance, `huldra daemon` exits
+successfully instead of starting a duplicate. If another program owns the
+port, stop it or choose a different port before loading the plist.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -146,10 +165,23 @@ set `KeepAlive` to true.
     <string>--db</string><string>/Users/YOUR_USER/.local/share/huldra/huldra.db</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>30</integer>
 </dict>
 </plist>
 ```
+
+This restarts the daemon only after an unsuccessful exit and caps rapid
+failure loops. A healthy pre-existing Huldra produces a successful exit, so
+`launchd` does not repeatedly retry it.
+
+Huldra does not rotate files owned by `launchd`, systemd, or another process
+manager. Apply the platform's log size and retention limits to captured stdout
+and stderr. In particular, do not point a long-running service at an
+unbounded file and enable `--emit-idle` at the same time.
 
 ## Docker
 
@@ -157,7 +189,7 @@ The MVP does not require Docker. If you containerize it, mount a persistent
 volume for `/data/huldra.db`, bind the service to `127.0.0.1` on the host, and
 run one API process plus one worker process against the same database.
 
-## Backup And Cleanup
+## Backup And Retention
 
 Stop the API and worker, then copy the SQLite files:
 
@@ -165,8 +197,51 @@ Stop the API and worker, then copy the SQLite files:
 cp ~/.local/share/huldra/huldra.db* /path/to/backup/
 ```
 
-Huldra does not implement retention cleanup yet. Delete or archive the database
-only when consumers no longer need the cached metadata.
+Preview rows older than 30 days that are eligible for cleanup:
+
+```bash
+uv run huldra store gc \
+  --db ~/.local/share/huldra/huldra.db \
+  --older-than-days 30 \
+  --json
+```
+
+The command requires an existing, initialized Huldra database and does not run
+schema initialization or migrations. It is a read-only dry run unless
+`--apply` is present. Review its eligible counts, then apply the same cutoff
+explicitly:
+
+```bash
+uv run huldra store gc \
+  --db ~/.local/share/huldra/huldra.db \
+  --older-than-days 30 \
+  --apply \
+  --json
+```
+
+Retention deletes old `events`, queue items in `completed` or `failed` state,
+and sync jobs in an explicit terminal-state allowlist. An expired async sync
+job handed off as queued, delayed, or claimed also becomes eligible after all
+cache/queue records associated with every page are completed or failed and
+older than the same cutoff. Active or recent work keeps the job ineligible.
+Deleting an eligible sync job also deletes its `sync_job_pages`; leases are
+never touched. Cached papers, cache entries, OAI harvest state, and OAI
+watermarks are outside this command's scope.
+
+SQLite reuses pages freed by deletion, but the database file normally does not
+shrink immediately. If physical file size must decrease, stop the API and
+worker, make the backup shown above, confirm that enough temporary disk space
+is available, and invoke the separate rewrite explicitly:
+
+```bash
+uv run huldra store vacuum \
+  --db ~/.local/share/huldra/huldra.db \
+  --json
+```
+
+`store vacuum` has no dry-run mode and does not initialize or migrate a
+database. Do not include it in unattended retention: SQLite needs additional
+disk space while rewriting the file and an exclusive maintenance window.
 
 ## Multi-Machine Limit
 

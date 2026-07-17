@@ -22,7 +22,7 @@ class HuldraSettings(BaseSettings):
     request_interval_seconds: float = 5.0
     cooldown_seconds: int = 3600
     request_timeout_seconds: float = 30.0
-    worker_poll_interval_seconds: float = 300.0
+    worker_poll_interval_seconds: float = Field(default=300.0, ge=1.0)
     lease_timeout_seconds: int = 120
     queue_claim_timeout_seconds: int = 300
     maturity_lag_days: int = 1

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import orjson
 import typer
 import uvicorn
@@ -34,6 +35,10 @@ _IMMEDIATE_WORKER_STATUSES = frozenset({"cache_hit", "completed", "failed"})
 
 def _print_json(payload: object) -> None:
     typer.echo(orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode())
+
+
+def _print_json_line(payload: object) -> None:
+    typer.echo(orjson.dumps(payload).decode())
 
 
 def _settings(db: Path | None = None) -> HuldraSettings:
@@ -79,6 +84,19 @@ def _worker_sleep_seconds(result: WorkerPassResult, settings: HuldraSettings) ->
     return settings.worker_poll_interval_seconds
 
 
+def _huldra_daemon_is_healthy(host: str, port: int) -> bool:
+    probe_host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
+    probe_url = httpx.URL(scheme="http", host=probe_host, port=port, path="/v1/status")
+    try:
+        with httpx.Client(timeout=1.0, trust_env=False) as client:
+            response = client.get(probe_url)
+            payload = response.json()
+    except (httpx.RequestError, ValueError):
+        return False
+    required_fields = {"upstream_requests_total", "queue_depth_total", "cache_entries_total"}
+    return response.status_code == 200 and isinstance(payload, dict) and required_fields <= payload.keys()
+
+
 @app.command()
 def version() -> None:
     typer.echo(f"huldra {__version__}")
@@ -91,6 +109,53 @@ def store_init(
     settings = _settings(db)
     HuldraStore(settings.db_path).init_schema()
     typer.echo(str(settings.db_path))
+
+
+@store_app.command("gc")
+def store_gc(
+    db: Annotated[Path | None, typer.Option("--db", help="SQLite database path.")] = None,
+    older_than_days: Annotated[
+        int,
+        typer.Option("--older-than-days", min=1, help="Delete records older than this many days."),
+    ] = 30,
+    apply_changes: Annotated[
+        bool,
+        typer.Option("--apply", help="Apply deletions; the default is a dry run."),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    settings = _settings(db)
+    store = HuldraStore(settings.db_path)
+    try:
+        result = store.gc(
+            cutoff=utc_now() - timedelta(days=older_than_days),
+            dry_run=not apply_changes,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--db") from exc
+    payload = result.model_dump(mode="json")
+    if json_output:
+        _print_json(payload)
+    else:
+        typer.echo(payload)
+
+
+@store_app.command("vacuum")
+def store_vacuum(
+    db: Annotated[Path | None, typer.Option("--db", help="SQLite database path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Rewrite an initialized store to reclaim free SQLite pages."""
+    settings = _settings(db)
+    try:
+        result = HuldraStore(settings.db_path).vacuum()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--db") from exc
+    payload = result.model_dump(mode="json")
+    if json_output:
+        _print_json(payload)
+    else:
+        typer.echo(payload)
 
 
 @app.command()
@@ -113,9 +178,13 @@ def worker(
     once: Annotated[bool, typer.Option("--once", help="Run one worker pass.")] = False,
     poll_interval_seconds: Annotated[
         float | None,
-        typer.Option("--poll-interval-seconds", help="Idle sleep seconds."),
+        typer.Option("--poll-interval-seconds", min=1.0, help="Idle sleep seconds (minimum 1)."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+    emit_idle: Annotated[
+        bool,
+        typer.Option("--emit-idle", help="Print idle worker passes."),
+    ] = False,
 ) -> None:
     settings = _settings(db)
     if poll_interval_seconds is not None:
@@ -125,10 +194,11 @@ def worker(
     while True:
         result = worker_instance.run_once()
         payload = result.as_payload()
-        if json_output:
-            _print_json(payload)
-        else:
-            typer.echo(payload)
+        if result.status != "idle" or emit_idle:
+            if json_output:
+                _print_json_line(payload)
+            else:
+                typer.echo(payload)
         if once:
             return
         sleep_seconds = _worker_sleep_seconds(result, settings)
@@ -148,6 +218,17 @@ def daemon(
         settings = settings.model_copy(update={"api_host": host})
     if port is not None:
         settings = settings.model_copy(update={"api_port": port})
+    if _huldra_daemon_is_healthy(settings.api_host, settings.api_port):
+        payload = {
+            "status": "already_running",
+            "host": settings.api_host,
+            "port": settings.api_port,
+        }
+        if json_output:
+            _print_json(payload)
+        else:
+            typer.echo(payload)
+        return
     if settings.api_host == "0.0.0.0":
         typer.echo(
             "warning: Huldra has no built-in auth; avoid exposing it publicly.",

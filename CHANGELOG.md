@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0 - 2026-07-17
+
+### Added
+
+- Dry-run-first `store gc` retention for old diagnostic events, terminal queue
+  items, and terminal sync jobs/pages while preserving active work and leases.
+- Explicit `store vacuum` maintenance and status counters for event, queue,
+  sync-job, and sync-page volume.
+
+### Changed
+
+- Idle worker passes are silent by default, worker JSON output is compact
+  JSON Lines, and `--emit-idle` enables short-lived idle diagnostics.
+- Worker polling now rejects intervals below one second.
+- Daemon startup detects a healthy Huldra already using the endpoint, and the
+  launchd guidance uses failure-only restart with throttling and bounded logs.
+
+### Fixed
+
+- Stopped persisting `worker_start` and `worker_stop` events for every worker
+  pass, which caused the events table and captured idle output to grow without
+  useful work.
+- Made retention previews read-only so they do not create or migrate a target
+  database.
+- Reclaimed expired async sync/backfill jobs after all associated queue/cache
+  work ages past the retention cutoff, while preserving jobs with active or
+  recent work.
+- Built daemon health-probe URLs safely for IPv6 bind literals.
+
 ## 0.2.0 - 2026-05-29
 
 ### Added

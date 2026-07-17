@@ -26,8 +26,116 @@ from huldra.models import (
     QueueWorkKind,
     RateState,
     RequestStatus,
+    RetentionGCResult,
+    StoreVacuumResult,
 )
 from huldra.time import ensure_utc, from_isoformat_or_none, isoformat_or_none, utc_now
+
+_TERMINAL_SYNC_JOB_STATUSES = (
+    "completed",
+    "failed",
+    "rate_limited",
+    "cache_unreadable",
+    "skipped",
+    "partial",
+    "overflow",
+)
+_TERMINAL_SYNC_JOB_PLACEHOLDERS = ",".join("?" for _ in _TERMINAL_SYNC_JOB_STATUSES)
+_ASYNC_SYNC_JOB_HANDOFF_STATUSES = ("queued", "delayed", "claimed")
+_ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS = ",".join(
+    "?" for _ in _ASYNC_SYNC_JOB_HANDOFF_STATUSES
+)
+_RETENTION_TABLES = frozenset(
+    {"cache_entries", "events", "queue_items", "sync_jobs", "sync_job_pages"}
+)
+# Async maintenance sets completed_at when handing work to a worker. Reclaim
+# that job only after all work records for every page are old and terminal.
+_RETENTION_SYNC_JOB_FILTER = f"""
+    job.completed_at IS NOT NULL
+    AND job.completed_at < ?
+    AND (
+        job.status IN ({_TERMINAL_SYNC_JOB_PLACEHOLDERS})
+        OR (
+            job.status IN ({_ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS})
+            AND EXISTS (
+                SELECT 1
+                FROM sync_job_pages AS page
+                WHERE page.sync_job_id = job.sync_job_id
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM sync_job_pages AS page
+                WHERE page.sync_job_id = job.sync_job_id
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM cache_entries AS non_expired_cache
+                          WHERE non_expired_cache.cache_key = page.cache_key
+                            AND (
+                                non_expired_cache.status NOT IN ('completed', 'failed')
+                                OR COALESCE(
+                                    CASE non_expired_cache.status
+                                        WHEN 'completed' THEN non_expired_cache.completed_at
+                                        WHEN 'failed' THEN non_expired_cache.requested_at
+                                    END >= ?,
+                                    1
+                                )
+                            )
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM queue_items AS non_expired_queue
+                          WHERE non_expired_queue.cache_key = page.cache_key
+                            AND (
+                                non_expired_queue.status NOT IN ('completed', 'failed')
+                                OR COALESCE(
+                                    CASE non_expired_queue.status
+                                        WHEN 'completed' THEN non_expired_queue.completed_at
+                                        WHEN 'failed' THEN non_expired_queue.updated_at
+                                    END >= ?,
+                                    1
+                                )
+                            )
+                      )
+                      OR (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM cache_entries AS terminal_cache
+                              WHERE terminal_cache.cache_key = page.cache_key
+                                AND terminal_cache.status IN ('completed', 'failed')
+                                AND CASE terminal_cache.status
+                                    WHEN 'completed' THEN terminal_cache.completed_at
+                                    WHEN 'failed' THEN terminal_cache.requested_at
+                                END < ?
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM queue_items AS terminal_queue
+                              WHERE terminal_queue.cache_key = page.cache_key
+                                AND terminal_queue.status IN ('completed', 'failed')
+                                AND CASE terminal_queue.status
+                                    WHEN 'completed' THEN terminal_queue.completed_at
+                                    WHEN 'failed' THEN terminal_queue.updated_at
+                                END < ?
+                          )
+                      )
+                  )
+            )
+        )
+    )
+"""
+
+
+def _retention_sync_job_params(cutoff: str) -> tuple[str, ...]:
+    return (
+        cutoff,
+        *_TERMINAL_SYNC_JOB_STATUSES,
+        *_ASYNC_SYNC_JOB_HANDOFF_STATUSES,
+        cutoff,
+        cutoff,
+        cutoff,
+        cutoff,
+    )
 
 
 class HuldraStore:
@@ -45,6 +153,18 @@ class HuldraStore:
         conn = sqlite3.connect(self.db_path, timeout=self.timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def connect_readonly(self) -> Iterator[sqlite3.Connection]:
+        database_uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(database_uri, timeout=self.timeout, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA query_only=ON")
         try:
             yield conn
         finally:
@@ -1405,7 +1525,6 @@ class HuldraStore:
                 """,
                 (name, timestamp, timestamp),
             )
-            self._record_event_conn(conn, "worker_start", {"name": name})
 
     def record_worker_heartbeat(
         self,
@@ -1479,7 +1598,6 @@ class HuldraStore:
                     error_message[:1000] if error_message else None,
                 ),
             )
-            self._record_event_conn(conn, "worker_stop", {"name": name})
 
     def status_summary(self, *, now: datetime | None = None) -> BrokerStatus:
         current = ensure_utc(now or utc_now())
@@ -1500,6 +1618,7 @@ class HuldraStore:
                     SUM(CASE WHEN status IN ('queued', 'claimed', 'delayed') THEN 1 ELSE 0 END) AS depth,
                     SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS ready,
                     SUM(CASE WHEN status = 'delayed' THEN 1 ELSE 0 END) AS delayed,
+                    SUM(CASE WHEN status IN ('completed', 'failed') THEN 1 ELSE 0 END) AS terminal,
                     MIN(CASE WHEN status IN ('queued', 'claimed', 'delayed') THEN created_at END) AS oldest
                 FROM queue_items
                 """
@@ -1514,6 +1633,26 @@ class HuldraStore:
                 """
             ).fetchone()
             papers = conn.execute("SELECT COUNT(*) AS total FROM papers").fetchone()
+            events = conn.execute("SELECT COUNT(*) AS total FROM events").fetchone()
+            sync_jobs = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(
+                        CASE
+                            WHEN status IN ({_TERMINAL_SYNC_JOB_PLACEHOLDERS})
+                                 AND completed_at IS NOT NULL
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS terminal
+                FROM sync_jobs
+                """,
+                _TERMINAL_SYNC_JOB_STATUSES,
+            ).fetchone()
+            sync_job_pages = conn.execute(
+                "SELECT COUNT(*) AS total FROM sync_job_pages"
+            ).fetchone()
             worker = conn.execute(
                 """
                 SELECT
@@ -1535,10 +1674,16 @@ class HuldraStore:
             queue_depth_total=int(queue["depth"] or 0),
             queue_ready_total=int(queue["ready"] or 0),
             queue_delayed_total=int(queue["delayed"] or 0),
+            queue_items_total=int(queue["total"]),
+            queue_terminal_total=int(queue["terminal"] or 0),
             cache_entries_total=int(cache["total"]),
             cache_completed_total=int(cache["completed"] or 0),
             cache_failed_total=int(cache["failed"] or 0),
             papers_total=int(papers["total"]),
+            events_total=int(events["total"]),
+            sync_jobs_total=int(sync_jobs["total"]),
+            sync_jobs_terminal_total=int(sync_jobs["terminal"] or 0),
+            sync_job_pages_total=int(sync_job_pages["total"]),
             worker_last_heartbeat_at=(
                 from_isoformat_or_none(worker["last_heartbeat_at"]) if worker else None
             ),
@@ -1552,6 +1697,163 @@ class HuldraStore:
                 worker["last_error_message"] if worker else None
             ),
             oldest_pending_request_at=from_isoformat_or_none(queue["oldest"]),
+        )
+
+    def gc(
+        self,
+        *,
+        cutoff: datetime,
+        dry_run: bool = True,
+    ) -> RetentionGCResult:
+        """Preview or delete old diagnostic and terminal workflow records."""
+        self._require_retention_schema()
+        normalized_cutoff = ensure_utc(cutoff)
+        cutoff_s = isoformat_or_none(normalized_cutoff)
+        assert cutoff_s is not None
+
+        if dry_run:
+            with self.connect_readonly() as conn:
+                counts = self._retention_eligible_counts(conn, cutoff_s)
+            return self._retention_result(normalized_cutoff, True, counts)
+
+        with self.begin_immediate() as conn:
+            counts = self._retention_eligible_counts(conn, cutoff_s)
+            events_deleted = conn.execute(
+                "DELETE FROM events WHERE created_at < ?",
+                (cutoff_s,),
+            ).rowcount
+            sync_jobs_deleted = conn.execute(
+                f"""
+                DELETE FROM sync_jobs
+                WHERE sync_job_id IN (
+                    SELECT job.sync_job_id
+                    FROM sync_jobs AS job
+                    WHERE {_RETENTION_SYNC_JOB_FILTER}
+                )
+                """,
+                _retention_sync_job_params(cutoff_s),
+            ).rowcount
+            queue_items_deleted = conn.execute(
+                """
+                DELETE FROM queue_items
+                WHERE (status = 'completed' AND completed_at IS NOT NULL AND completed_at < ?)
+                   OR (status = 'failed' AND updated_at < ?)
+                """,
+                (cutoff_s, cutoff_s),
+            ).rowcount
+
+        deleted = (
+            events_deleted,
+            queue_items_deleted,
+            sync_jobs_deleted,
+            counts[3],
+        )
+        return self._retention_result(normalized_cutoff, False, counts, deleted)
+
+    def vacuum(self) -> StoreVacuumResult:
+        """Rewrite an initialized store to reclaim free SQLite pages."""
+        self._require_retention_schema()
+        storage_bytes_before = self._sqlite_storage_bytes()
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        storage_bytes_after = self._sqlite_storage_bytes()
+        return StoreVacuumResult(
+            database_path=str(self.db_path),
+            storage_bytes_before=storage_bytes_before,
+            storage_bytes_after=storage_bytes_after,
+            reclaimed_bytes=max(0, storage_bytes_before - storage_bytes_after),
+        )
+
+    def _require_retention_schema(self) -> None:
+        try:
+            with self.connect_readonly() as conn:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise ValueError(f"Huldra store does not exist or is unreadable: {self.db_path}") from exc
+        table_names = {str(row["name"]) for row in rows}
+        missing_tables = _RETENTION_TABLES - table_names
+        if missing_tables:
+            missing = ", ".join(sorted(missing_tables))
+            raise ValueError(f"Huldra schema is not initialized; missing tables: {missing}")
+
+    def _sqlite_storage_bytes(self) -> int:
+        paths = (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        )
+        return sum(path.stat().st_size for path in paths if path.exists())
+
+    @staticmethod
+    def _retention_eligible_counts(
+        conn: sqlite3.Connection,
+        cutoff: str,
+    ) -> tuple[int, int, int, int]:
+        row = conn.execute(
+            f"""
+            WITH eligible_sync_jobs AS (
+                SELECT job.sync_job_id
+                FROM sync_jobs AS job
+                WHERE {_RETENTION_SYNC_JOB_FILTER}
+            )
+            SELECT
+                (SELECT COUNT(*) FROM events WHERE created_at < ?) AS events,
+                (
+                    SELECT COUNT(*)
+                    FROM queue_items
+                    WHERE (status = 'completed' AND completed_at IS NOT NULL AND completed_at < ?)
+                       OR (status = 'failed' AND updated_at < ?)
+                ) AS queue_items,
+                (
+                    SELECT COUNT(*)
+                    FROM eligible_sync_jobs
+                ) AS sync_jobs,
+                (
+                    SELECT COUNT(*)
+                    FROM sync_job_pages AS page
+                    JOIN eligible_sync_jobs AS job
+                      ON job.sync_job_id = page.sync_job_id
+                ) AS sync_job_pages
+            """,
+            (
+                *_retention_sync_job_params(cutoff),
+                cutoff,
+                cutoff,
+                cutoff,
+            ),
+        ).fetchone()
+        assert row is not None
+        return (
+            int(row["events"]),
+            int(row["queue_items"]),
+            int(row["sync_jobs"]),
+            int(row["sync_job_pages"]),
+        )
+
+    @staticmethod
+    def _retention_result(
+        cutoff: datetime,
+        dry_run: bool,
+        eligible: tuple[int, int, int, int],
+        deleted: tuple[int, int, int, int] = (0, 0, 0, 0),
+    ) -> RetentionGCResult:
+        return RetentionGCResult(
+            cutoff=cutoff,
+            dry_run=dry_run,
+            events_eligible_total=eligible[0],
+            queue_items_eligible_total=eligible[1],
+            sync_jobs_eligible_total=eligible[2],
+            sync_job_pages_eligible_total=eligible[3],
+            eligible_total=sum(eligible),
+            events_deleted_total=deleted[0],
+            queue_items_deleted_total=deleted[1],
+            sync_jobs_deleted_total=deleted[2],
+            sync_job_pages_deleted_total=deleted[3],
+            deleted_total=sum(deleted),
         )
 
     def events(self) -> list[dict[str, Any]]:
