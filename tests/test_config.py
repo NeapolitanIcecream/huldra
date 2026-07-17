@@ -29,3 +29,8 @@ def test_settings_read_huldra_environment_variables(
 def test_request_interval_rejects_values_below_arxiv_floor() -> None:
     with pytest.raises(ValueError, match="at least 3"):
         HuldraSettings(request_interval_seconds=2.9)
+
+
+def test_worker_poll_interval_rejects_subsecond_values() -> None:
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        HuldraSettings(worker_poll_interval_seconds=0.5)

@@ -227,15 +227,43 @@ class BrokerStatus(HuldraResponseModel):
     queue_depth_total: int = 0
     queue_ready_total: int = 0
     queue_delayed_total: int = 0
+    queue_items_total: int = 0
+    queue_terminal_total: int = 0
     cache_entries_total: int = 0
     cache_completed_total: int = 0
     cache_failed_total: int = 0
     papers_total: int = 0
+    events_total: int = 0
+    sync_jobs_total: int = 0
+    sync_jobs_terminal_total: int = 0
+    sync_job_pages_total: int = 0
     worker_last_heartbeat_at: datetime | None = None
     worker_next_wake_at: datetime | None = None
     worker_last_error_category: str | None = None
     worker_last_error_message: str | None = None
     oldest_pending_request_at: datetime | None = None
+
+
+class RetentionGCResult(HuldraResponseModel):
+    cutoff: datetime
+    dry_run: bool = True
+    events_eligible_total: int = 0
+    queue_items_eligible_total: int = 0
+    sync_jobs_eligible_total: int = 0
+    sync_job_pages_eligible_total: int = 0
+    eligible_total: int = 0
+    events_deleted_total: int = 0
+    queue_items_deleted_total: int = 0
+    sync_jobs_deleted_total: int = 0
+    sync_job_pages_deleted_total: int = 0
+    deleted_total: int = 0
+
+
+class StoreVacuumResult(HuldraResponseModel):
+    database_path: str
+    storage_bytes_before: int
+    storage_bytes_after: int
+    reclaimed_bytes: int
 
 
 class ArxivResult(HuldraResponseModel):
