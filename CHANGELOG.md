@@ -27,6 +27,7 @@
 - Reclaimed expired async sync/backfill jobs after all associated queue/cache
   work ages past the retention cutoff, while preserving jobs with active or
   recent work.
+- Built daemon health-probe URLs safely for IPv6 bind literals.
 
 ## 0.2.0 - 2026-05-29
 

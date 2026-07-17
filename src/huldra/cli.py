@@ -85,10 +85,11 @@ def _worker_sleep_seconds(result: WorkerPassResult, settings: HuldraSettings) ->
 
 
 def _huldra_daemon_is_healthy(host: str, port: int) -> bool:
-    probe_host = "127.0.0.1" if host == "0.0.0.0" else "[::1]" if host == "::" else host
+    probe_host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
+    probe_url = httpx.URL(scheme="http", host=probe_host, port=port, path="/v1/status")
     try:
         with httpx.Client(timeout=1.0, trust_env=False) as client:
-            response = client.get(f"http://{probe_host}:{port}/v1/status")
+            response = client.get(probe_url)
             payload = response.json()
     except (httpx.RequestError, ValueError):
         return False
