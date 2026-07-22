@@ -10,6 +10,7 @@ from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, OaiRecord, RateState
 from huldra.oai import OaiPmhPage
+from huldra.planner import build_submitted_date_windows
 from huldra.time import utc_now
 from tests.conftest import make_paper
 
@@ -241,7 +242,73 @@ def test_api_backfill_endpoint_plans_windows(settings: HuldraSettings) -> None:
     assert payload["queued_total"] == 2
 
 
-def test_api_backfill_rejects_request_budget_before_planning(
+def test_api_sync_admits_cached_requests_above_upstream_budget(
+    settings: HuldraSettings,
+) -> None:
+    store = HuldraStore(settings.db_path)
+    store.init_schema()
+    requests = [
+        ArxivRequest(client_id="api", search_query="cat:cs.AI", max_results=1),
+        ArxivRequest(client_id="api", search_query="cat:cs.LG", max_results=1),
+    ]
+    for index, request in enumerate(requests, start=1):
+        store.record_completed_cache_entry(
+            cache_key=request_cache_key(request),
+            request=request,
+            papers=[make_paper(f"2401.0000{index}v1")],
+        )
+
+    response = TestClient(create_app(settings)).post(
+        "/v1/sync",
+        json={
+            "requests": [request.model_dump(mode="json") for request in requests],
+            "max_requests_total": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cache_hit_total"] == 2
+    assert payload["upstream_requests_total"] == 0
+
+
+def test_api_backfill_admits_cached_windows_above_upstream_budget(
+    settings: HuldraSettings,
+) -> None:
+    store = HuldraStore(settings.db_path)
+    store.init_schema()
+    windows = build_submitted_date_windows(
+        search_queries=["cat:cs.AI"],
+        start_date=datetime(2026, 1, 1, tzinfo=UTC).date(),
+        end_date=datetime(2026, 1, 2, tzinfo=UTC).date(),
+        max_results=1,
+        client_id="huldra-backfill",
+    )
+    for index, request in enumerate(windows, start=1):
+        store.record_completed_cache_entry(
+            cache_key=request_cache_key(request),
+            request=request,
+            papers=[make_paper(f"2401.0000{index}v1")],
+        )
+
+    response = TestClient(create_app(settings)).post(
+        "/v1/backfill",
+        json={
+            "search_queries": ["cat:cs.AI"],
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+            "max_results": 1,
+            "max_requests_total": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cache_hit_total"] == 2
+    assert payload["upstream_requests_total"] == 0
+
+
+def test_api_backfill_rejects_missing_work_above_request_budget(
     settings: HuldraSettings,
 ) -> None:
     response = TestClient(create_app(settings)).post(

@@ -839,6 +839,42 @@ def test_oai_running_harvest_resumes_from_atomic_page_checkpoint(
         assert conn.execute("SELECT COUNT(*) FROM oai_harvest_jobs").fetchone()[0] == 1
 
 
+def test_oai_explicit_token_does_not_recover_running_job_at_other_cursor(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    crashed_request = OaiHarvestRequest(
+        client_id="crashed",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+    )
+    crashed_harvest_id = store.create_oai_harvest_job(
+        crashed_request,
+        resumption_token="crashed-token",
+    )
+    fetcher = FakeOaiFetcher(
+        [parse_oai_pmh_list_records(OAI_DELETED_PAGE)],
+        [],
+    )
+
+    result = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="manual",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            resumption_token="caller-token",
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.harvest_id != crashed_harvest_id
+    assert fetcher.seen[0]["resumption_token"] == "caller-token"
+
+
 def test_oai_repeated_resumption_token_fails_without_refetch_loop(
     store: HuldraStore,
     settings: HuldraSettings,

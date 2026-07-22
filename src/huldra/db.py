@@ -1160,8 +1160,14 @@ class HuldraStore:
                 previous = _oai_request_from_json(row["request_json"])
             except ValueError:
                 continue
-            if _same_oai_resume_scope(previous, request):
-                return _oai_harvest_state_from_row(row)
+            if not _same_oai_resume_scope(previous, request):
+                continue
+            if (
+                request.resumption_token is not None
+                and row["resumption_token"] != request.resumption_token
+            ):
+                continue
+            return _oai_harvest_state_from_row(row)
         return None
 
     def record_oai_request_started(self, harvest_id: str) -> int:

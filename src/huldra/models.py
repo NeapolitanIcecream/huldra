@@ -394,8 +394,6 @@ class HuldraSyncRequest(HuldraModel):
     def _complete_window_requires_wait(self) -> HuldraSyncRequest:
         if self.mode == LegacySyncMode.COMPLETE_WINDOW and not self.wait:
             raise ValueError("complete_window mode requires wait=True")
-        if len(self.requests) > self.max_requests_total:
-            raise ValueError("sync request exceeds request budget")
         return self
 
 
@@ -433,9 +431,6 @@ class HuldraBackfillRequest(HuldraModel):
             raise ValueError("start_date must be on or before end_date")
         if self.mode == LegacySyncMode.COMPLETE_WINDOW and not self.wait:
             raise ValueError("complete_window mode requires wait=True")
-        windows_total = (self.end_date - self.start_date).days + 1
-        if windows_total * len(self.search_queries) > self.max_requests_total:
-            raise ValueError("backfill plan exceeds request budget")
         return self
 
 

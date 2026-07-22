@@ -59,29 +59,35 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
 
     @app.post("/v1/sync", response_model=HuldraMaintenanceResult)
     def sync_windows(request: HuldraSyncRequest) -> HuldraMaintenanceResult:
-        return broker.sync_windows(
-            request.requests,
-            wait=request.wait,
-            wait_timeout_seconds=request.wait_timeout_seconds,
-            mode=request.mode,
-            max_pages_per_window=request.max_pages_per_window,
-            max_requests_total=request.max_requests_total,
-        )
+        try:
+            return broker.sync_windows(
+                request.requests,
+                wait=request.wait,
+                wait_timeout_seconds=request.wait_timeout_seconds,
+                mode=request.mode,
+                max_pages_per_window=request.max_pages_per_window,
+                max_requests_total=request.max_requests_total,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/backfill", response_model=HuldraMaintenanceResult)
     def backfill_windows(request: HuldraBackfillRequest) -> HuldraMaintenanceResult:
-        return broker.backfill_windows(
-            search_queries=request.search_queries,
-            start_date=request.start_date,
-            end_date=request.end_date,
-            max_results=request.max_results,
-            wait=request.wait,
-            wait_timeout_seconds=request.wait_timeout_seconds,
-            mode=request.mode,
-            client_id=request.client_id,
-            max_pages_per_window=request.max_pages_per_window,
-            max_requests_total=request.max_requests_total,
-        )
+        try:
+            return broker.backfill_windows(
+                search_queries=request.search_queries,
+                start_date=request.start_date,
+                end_date=request.end_date,
+                max_results=request.max_results,
+                wait=request.wait,
+                wait_timeout_seconds=request.wait_timeout_seconds,
+                mode=request.mode,
+                client_id=request.client_id,
+                max_pages_per_window=request.max_pages_per_window,
+                max_requests_total=request.max_requests_total,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/harvest/oai", response_model=OaiHarvestResult)
     def harvest_oai(request: OaiHarvestRequest) -> OaiHarvestResult:
