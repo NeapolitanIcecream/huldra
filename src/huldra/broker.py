@@ -706,14 +706,13 @@ class HuldraBroker:
             raise ValueError("maintenance budgets must be positive")
         if not requests:
             return HuldraMaintenanceResult()
-        initial_plan = [
-            (
-                request,
-                request_cache_key(request),
-                self.store.get_readable_completed_cache(request_cache_key(request)),
-            )
-            for request in requests
-        ]
+        initial_plan: list[tuple[ArxivRequest, str, CacheEntry | None]] = []
+        for request in requests:
+            cache_key = request_cache_key(request)
+            readable = self.store.get_readable_completed_cache(cache_key)
+            if readable is None and self._try_compose_cached_id_list(request, cache_key) is not None:
+                readable = self.store.get_readable_completed_cache(cache_key)
+            initial_plan.append((request, cache_key, readable))
         initial_requests_total = len(
             {
                 cache_key
@@ -736,7 +735,10 @@ class HuldraBroker:
                 deadline,
                 initial_requests_total,
                 self.settings.request_interval_seconds,
-                first_request_may_start_now=True,
+                initial_wait_seconds=HuldraRateLimiter(
+                    self.store,
+                    self.settings,
+                ).seconds_until_next_request(),
             )
         ):
             raise ValueError("maintenance plan exceeds runtime deadline budget")
@@ -1298,7 +1300,10 @@ class HuldraBroker:
             budget.deadline,
             missing_pages_total,
             self.settings.request_interval_seconds,
-            first_request_may_start_now=False,
+            initial_wait_seconds=HuldraRateLimiter(
+                self.store,
+                self.settings,
+            ).seconds_until_next_request(),
         ):
             self._complete_window_budget_failure(
                 target,
@@ -1921,10 +1926,11 @@ def _deadline_can_fit_requests(
     requests_total: int,
     interval_seconds: float,
     *,
-    first_request_may_start_now: bool,
+    initial_wait_seconds: float,
 ) -> bool:
-    intervals_total = max(0, requests_total - 1) if first_request_may_start_now else requests_total
-    minimum_seconds = intervals_total * interval_seconds
+    minimum_seconds = max(0.0, initial_wait_seconds) + (
+        max(0, requests_total - 1) * interval_seconds
+    )
     return time.monotonic() + minimum_seconds <= deadline
 
 

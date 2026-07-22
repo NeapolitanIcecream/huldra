@@ -118,6 +118,60 @@ def test_complete_window_counts_duplicate_misses_as_one_request(
     assert len(fetcher.seen) == 1
 
 
+def test_sync_request_admission_excludes_id_lists_composed_from_paper_store(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    store.upsert_papers([make_paper("2401.00001v1"), make_paper("2401.00002v1")])
+    requests = [
+        ArxivRequest(client_id="first", id_list=("2401.00001v1",)),
+        ArxivRequest(client_id="second", id_list=("2401.00002v1",)),
+    ]
+    fetcher = CapturingFetcher([], [])
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        requests,
+        wait=True,
+        max_requests_total=1,
+    )
+
+    assert result.completed_windows_total == 2
+    assert result.cache_hit_total == 2
+    assert result.upstream_requests_total == 0
+    assert fetcher.seen == []
+
+
+def test_complete_window_cached_first_page_allows_immediate_followup(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    tuned = settings.model_copy(update={"request_interval_seconds": 5.0})
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    store.record_completed_cache_entry(
+        cache_key=request_cache_key(request),
+        request=request,
+        papers=[make_paper("2401.00001v1")],
+        total_results=2,
+    )
+    fetcher = CapturingFetcher(
+        [FetchResult([make_paper("2401.00002v1")], total_results=2)],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=tuned, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=4,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=2,
+        max_requests_total=1,
+    )
+
+    assert result.complete_windows_total == 1
+    assert result.upstream_requests_total == 1
+    assert [seen.start for seen in fetcher.seen] == [1]
+
+
 def test_complete_window_caps_atom_request_to_remaining_runtime(
     store: HuldraStore,
     settings: HuldraSettings,
