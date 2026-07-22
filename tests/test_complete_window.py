@@ -197,6 +197,37 @@ def test_complete_window_uses_result_count_for_first_followup_offset(
     assert [seen.start for seen in fetcher.seen] == [0, 1]
 
 
+def test_complete_window_rejects_cross_page_duplicate_papers(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    fetcher = CapturingFetcher(
+        [
+            FetchResult([make_paper("2401.00001v1")], total_results=3),
+            FetchResult([make_paper("2401.00001v1")], total_results=3),
+            FetchResult([make_paper("2401.00003v1")], total_results=3),
+        ],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=10,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+    )
+
+    assert result.completed_windows_total == 0
+    assert result.partial_windows_total == 1
+    assert result.requests[0].coverage_status == CoverageStatus.PARTIAL
+    assert result.requests[0].result_count == 2
+    assert result.requests[0].error_category == "overlapping_page_results"
+    assert result.requests[0].pages_completed_total == 3
+
+
 def test_complete_window_overflow_does_not_fetch_followup_pages(
     store: HuldraStore,
     settings: HuldraSettings,
@@ -496,6 +527,43 @@ def test_complete_window_joined_queue_item_consumes_maintenance_budget(
         ).fetchone()
     assert tuple(budget) == (membership["budget_id"], 1)
     assert membership["last_charged_attempt"] == 1
+
+
+def test_complete_window_deadline_is_reported_when_shared_item_is_preserved(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ArxivRequest(client_id="ordinary", search_query="cat:cs.AI", max_results=1)
+    ordinary_item = store.enqueue_request(request)
+    assert store.acquire_lease("upstream_fetch", "other-worker", 60)
+    elapsed = [0.0]
+
+    def advance_past_deadline(_seconds: float) -> None:
+        elapsed[0] = 2.0
+
+    monkeypatch.setattr(broker_module.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(broker_module.time, "sleep", advance_past_deadline)
+
+    result = HuldraBroker(store=store, settings=settings).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=1,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    request_result = result.requests[0]
+    sync_job = store.get_sync_job(request_result.sync_job_id or "")
+    preserved = store.get_queue_item(ordinary_item.request_id)
+    assert request_result.error_category == "deadline_budget_exceeded"
+    assert result.budget_exhausted_windows_total == 1
+    assert sync_job is not None
+    assert sync_job["error_category"] == "deadline_budget_exceeded"
+    assert preserved is not None
+    assert preserved.status == "delayed"
+    assert preserved.upstream_budget_id is None
 
 
 def test_complete_window_rechecks_deadline_before_each_followup_enqueue(

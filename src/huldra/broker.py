@@ -13,7 +13,7 @@ from loguru import logger
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.fetcher import NonRetryableFetchError, RateLimitedError, TransientFetchError
-from huldra.keys import normalize_arxiv_id, request_cache_key
+from huldra.keys import arxiv_id_family_base, normalize_arxiv_id, request_cache_key
 from huldra.limiter import HuldraRateLimiter
 from huldra.models import (
     ArxivRawInspectionResult,
@@ -1102,11 +1102,20 @@ class HuldraBroker:
             if worker_result.status == "idle":
                 time.sleep(min(0.05, max(0.01, timeout / 50)))
         if upstream_budget_id is not None and time.monotonic() >= deadline:
+            expired_targets = [
+                target for target in targets if not self._target_terminal(target)
+            ]
+            error_category = "deadline_budget_exceeded"
+            error_message = "maintenance deadline expired before upstream fetch"
             self.store.fail_active_upstream_budget_items(
                 upstream_budget_id,
-                error_category="deadline_budget_exceeded",
-                error_message="maintenance deadline expired before upstream fetch",
+                error_category=error_category,
+                error_message=error_message,
             )
+            for target in expired_targets:
+                target.aggregate_raw_status = "partial"
+                target.aggregate_error_category = error_category
+                target.aggregate_error_message = error_message
         return result
 
     def _plan_and_drain_complete_window_target(
@@ -1118,10 +1127,16 @@ class HuldraBroker:
     ) -> HuldraMaintenanceResult:
         sync_job_id = target.sync_job_id
         assert sync_job_id is not None
-        if (
-            target.request_id is None
-            and target.aggregate_error_category == "deadline_budget_exceeded"
-        ):
+        if target.aggregate_error_category == "deadline_budget_exceeded":
+            if target.coverage_status == CoverageStatus.UNKNOWN:
+                self._complete_initial_maintenance_budget_failure(
+                    target,
+                    error_category=target.aggregate_error_category,
+                    error_message=(
+                        target.aggregate_error_message
+                        or "maintenance deadline expired before upstream fetch"
+                    ),
+                )
             return result
         first = self.store.get_readable_completed_cache(target.cache_key)
         self.store.refresh_sync_job_page_from_cache(
@@ -1432,8 +1447,10 @@ class HuldraBroker:
         sync_job_id = target.sync_job_id
         assert sync_job_id is not None
         result_count = 0
+        page_results_total = 0
         total_results = target.total_results
         pages_completed = 0
+        unique_paper_ids: set[str] = set()
         first_error_category = None
         first_error_message = None
         for page_target in page_targets:
@@ -1444,17 +1461,34 @@ class HuldraBroker:
             )
             readable = self.store.get_readable_completed_cache(page_target.cache_key)
             if readable is not None:
-                result_count += readable.result_count
+                page_results_total += readable.result_count
+                unique_paper_ids.update(
+                    arxiv_id_family_base(paper.arxiv_id)
+                    for paper in self.store.get_cached_papers(page_target.cache_key)
+                )
                 total_results = readable.total_results if total_results is None else total_results
                 pages_completed += 1
             elif first_error_category is None:
-                first_error_category = page.get("error_category")
+                first_error_category = (
+                    page_target.aggregate_error_category or page.get("error_category")
+                )
                 entry = self.store.get_cache_entry(page_target.cache_key)
-                first_error_message = entry.error_message if entry is not None else None
+                first_error_message = page_target.aggregate_error_message or (
+                    entry.error_message if entry is not None else None
+                )
         pages_total = len(page_targets)
+        result_count = len(unique_paper_ids)
+        overlapping_results_total = page_results_total - result_count
+        if overlapping_results_total > 0 and first_error_category is None:
+            first_error_category = "overlapping_page_results"
+            first_error_message = (
+                "legacy search pages contained "
+                f"{overlapping_results_total} duplicate or overlapping paper results"
+            )
         complete = (
             total_results is not None
             and pages_completed == pages_total
+            and overlapping_results_total == 0
             and result_count >= max(0, total_results - target.request.start)
         )
         target.coverage_status = CoverageStatus.COMPLETE if complete else CoverageStatus.PARTIAL
@@ -1589,6 +1623,10 @@ class HuldraBroker:
             request_cooldown_until = cache_entry.cooldown_until if cache_entry is not None else None
             request_error_category = cache_entry.error_category if cache_entry is not None else None
             request_error_message = cache_entry.error_message if cache_entry is not None else None
+            if queue_item is not None and (cache_entry is None or cache_entry.status == "completed"):
+                request_cooldown_until = queue_item.next_attempt_at or request_cooldown_until
+                request_error_category = queue_item.error_category or request_error_category
+                request_error_message = queue_item.error_message or request_error_message
             if target.aggregate_error_category is not None:
                 request_error_category = target.aggregate_error_category
             if target.aggregate_error_message is not None:
@@ -1599,10 +1637,6 @@ class HuldraBroker:
                 "deadline_budget_exceeded",
             }:
                 budget_exhausted_total += 1
-            if queue_item is not None and (cache_entry is None or cache_entry.status == "completed"):
-                request_cooldown_until = queue_item.next_attempt_at or request_cooldown_until
-                request_error_category = queue_item.error_category or request_error_category
-                request_error_message = queue_item.error_message or request_error_message
             if (
                 target.sync_job_id is not None
                 and mode == LegacySyncMode.SLICE
