@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0 - 2026-07-22
+
+### Added
+
+- Hard page, request, and runtime budgets for complete-window maintenance and
+  OAI-PMH harvests, exposed consistently through the API, client, and CLI.
+- Durable OAI page checkpoints, request accounting, deadlines, and same-scope
+  leases so interrupted harvests resume without replaying committed pages.
+- Persisted stale-while-revalidate freshness deadlines with atomic refresh
+  reservation across broker processes.
+- Low-cardinality request timing and rate-limit diagnostics in events and
+  broker status.
+
+### Changed
+
+- HTTP 429 and OAI `503 + Retry-After` now share adaptive exponential cooldown
+  while retaining separate durable counters. `Retry-After` is a hard lower
+  bound, and random jitter only extends the wait.
+- Complete-window and backfill planning reject work before queue expansion when
+  their request budgets cannot cover the initial plan.
+- Store schema advances to v7, adding durable upstream request budgets; normal
+  store initialization upgrades prior schemas in place.
+
+### Fixed
+
+- Closed a limiter race by acquiring the shared upstream lease before reading
+  durable cooldown state.
+- Bounded malformed OAI pagination, including repeated tokens, token cycles,
+  and pages that make no progress.
+- Prevented a crash after the final OAI page checkpoint from refetching that
+  page on restart.
+
 ## 0.3.0 - 2026-07-17
 
 ### Added

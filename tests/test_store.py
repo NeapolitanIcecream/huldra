@@ -477,6 +477,21 @@ def test_rate_state_and_leases_are_durable(store: HuldraStore) -> None:
     assert store.acquire_lease("upstream_fetch", "w2", 60)
 
 
+def test_strict_lease_renewal_never_reacquires_a_missing_or_replaced_lease(
+    store: HuldraStore,
+) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    assert store.acquire_lease("upstream_fetch", "w1", 3, now=now)
+    assert store.renew_lease_if_owned("upstream_fetch", "w1", 10, now=now)
+
+    store.release_lease("upstream_fetch", "w1")
+    assert not store.renew_lease_if_owned("upstream_fetch", "w1", 10, now=now)
+
+    assert store.acquire_lease("upstream_fetch", "w2", 3, now=now)
+    assert not store.renew_lease_if_owned("upstream_fetch", "w1", 10, now=now)
+    assert store.renew_lease_if_owned("upstream_fetch", "w2", 10, now=now)
+
+
 def test_release_or_delay_marks_queue_item_failed(store: HuldraStore) -> None:
     item = store.enqueue_request(ArxivRequest(client_id="demo", search_query="cat:cs.AI"))
     store.release_or_delay_queue_item(

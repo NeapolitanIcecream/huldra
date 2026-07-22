@@ -7,6 +7,7 @@ from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, CachePolicy, ReadinessMode
+from huldra.time import utc_now
 from tests.conftest import make_paper
 
 
@@ -16,6 +17,7 @@ def _record(store: HuldraStore, request: ArxivRequest) -> str:
         cache_key=key,
         request=request,
         papers=[make_paper()],
+        completed_at=utc_now() - timedelta(hours=2),
     )
     return key
 

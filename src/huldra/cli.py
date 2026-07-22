@@ -324,6 +324,14 @@ def sync(
         float | None,
         typer.Option("--wait-timeout-seconds", help="Maintenance wait timeout."),
     ] = None,
+    max_pages_per_window: Annotated[
+        int,
+        typer.Option("--max-pages-per-window", min=1, max=10_000),
+    ] = 100,
+    max_requests_total: Annotated[
+        int,
+        typer.Option("--max-requests-total", min=1, max=100_000),
+    ] = 500,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     queries = search_query or []
@@ -345,6 +353,8 @@ def sync(
         wait=wait,
         wait_timeout_seconds=wait_timeout_seconds,
         mode=parsed_mode,
+        max_pages_per_window=max_pages_per_window,
+        max_requests_total=max_requests_total,
     ).model_dump(mode="json")
     if json_output:
         _print_json(payload)
@@ -378,6 +388,14 @@ def backfill(
         float | None,
         typer.Option("--wait-timeout-seconds", help="Maintenance wait timeout."),
     ] = None,
+    max_pages_per_window: Annotated[
+        int,
+        typer.Option("--max-pages-per-window", min=1, max=10_000),
+    ] = 100,
+    max_requests_total: Annotated[
+        int,
+        typer.Option("--max-requests-total", min=1, max=100_000),
+    ] = 500,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     if start_date is None:
@@ -396,6 +414,8 @@ def backfill(
         wait_timeout_seconds=wait_timeout_seconds,
         mode=parsed_mode,
         client_id=client_id,
+        max_pages_per_window=max_pages_per_window,
+        max_requests_total=max_requests_total,
     ).model_dump(mode="json")
     if json_output:
         _print_json(payload)
@@ -434,6 +454,12 @@ def harvest_oai(
         typer.Option("--mode", help="initial or incremental."),
     ] = "incremental",
     client_id: Annotated[str, typer.Option("--client-id", help="Client identifier.")] = "cli-harvest",
+    max_pages: Annotated[int, typer.Option("--max-pages", min=1, max=100_000)] = 1000,
+    max_requests: Annotated[int, typer.Option("--max-requests", min=1, max=100_000)] = 1000,
+    runtime_budget_seconds: Annotated[
+        float,
+        typer.Option("--runtime-budget-seconds", min=0.001, max=604_800),
+    ] = 3600.0,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
 ) -> None:
     if metadata_prefix not in {"arXiv", "arXivRaw"}:
@@ -448,6 +474,9 @@ def harvest_oai(
             until_datestamp=until_datestamp,
             resumption_token=resumption_token,
             mode=_parse_oai_mode(mode),
+            max_pages=max_pages,
+            max_requests=max_requests,
+            runtime_budget_seconds=runtime_budget_seconds,
         )
     ).model_dump(mode="json")
     if json_output:

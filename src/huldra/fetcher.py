@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any
+from math import ceil
+from typing import Any, Literal
 
 import httpx
 
@@ -20,6 +21,10 @@ class HuldraFetchError(RuntimeError):
         self.status_code = status_code
 
 
+RateLimitKind = Literal["http_429", "oai_503_retry_after"]
+UpstreamApiFamily = Literal["legacy_api", "oai_pmh"]
+
+
 class RateLimitedError(HuldraFetchError):
     def __init__(
         self,
@@ -27,9 +32,13 @@ class RateLimitedError(HuldraFetchError):
         message: str = "rate limited",
         *,
         status_code: int = 429,
+        rate_limit_kind: RateLimitKind = "http_429",
+        api_family: UpstreamApiFamily = "legacy_api",
     ) -> None:
         super().__init__(message, status_code=status_code)
         self.retry_after_seconds = retry_after_seconds
+        self.rate_limit_kind = rate_limit_kind
+        self.api_family = api_family
 
 
 class TransientFetchError(HuldraFetchError):
@@ -118,4 +127,4 @@ def _parse_retry_after_seconds(raw: Any, *, now: datetime | None = None) -> int 
     if target.tzinfo is None:
         target = target.replace(tzinfo=UTC)
     delta = ensure_utc(target) - ensure_utc(now or utc_now())
-    return max(0, int(delta.total_seconds()))
+    return max(0, ceil(delta.total_seconds()))

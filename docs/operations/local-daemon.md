@@ -21,11 +21,12 @@ Check status:
 uv run huldra status --db ~/.local/share/huldra/huldra.db --json
 ```
 
-The status payload shows `cooldown_until` and `cooldown_active` so supervisors
-can tell when arXiv returned HTTP 429 and the worker is waiting. It also reports
-`events_total`, `queue_items_total`, `queue_terminal_total`, `sync_jobs_total`,
-`sync_jobs_terminal_total`, and `sync_job_pages_total` without returning the
-underlying event or workflow rows.
+The status payload shows `cooldown_until`, `cooldown_active`, separate HTTP 429
+and OAI `503 + Retry-After` counters, the consecutive rate-limit count, and the
+last request's wait, latency, effective cooldown, API family, and rate-limit
+kind. It also reports `events_total`, `queue_items_total`,
+`queue_terminal_total`, `sync_jobs_total`, `sync_jobs_terminal_total`, and
+`sync_job_pages_total` without returning the underlying event or workflow rows.
 
 Idle worker passes are silent by default. With `--json`, each non-idle pass is
 one compact JSON line. Use `--emit-idle` only when debugging a short run; a
@@ -59,6 +60,8 @@ uv run huldra sync \
   --date 2026-05-20 \
   --max-results 60 \
   --mode complete-window \
+  --max-pages-per-window 100 \
+  --max-requests-total 500 \
   --wait \
   --json
 ```
@@ -83,6 +86,13 @@ For complete-window jobs, inspect `coverage_status`, `pages_total`, and
 `pages_completed_total`; `overflow` means the window exceeded the configured
 legacy search cap and was not treated as complete.
 
+`--max-pages-per-window` is a hard admission budget. `--max-requests-total` is
+also a durable upstream-attempt limit: retries consume the same persisted
+budget, and workers recheck its deadline after any rate-limit wait and before
+network I/O. Huldra checks both limits before adding follow-up pages or initial
+backfill windows, so a small requested result slice cannot silently expand into
+an unbounded crawl.
+
 You can run `sync --wait` without a separate worker for short pre-syncs. Keep a
 supervised worker running for normal background draining and stale refresh work.
 
@@ -97,13 +107,34 @@ uv run huldra harvest oai \
   --metadata-prefix arXiv \
   --set cs:cs:AI \
   --mode incremental \
+  --max-pages 1000 \
+  --max-requests 1000 \
+  --runtime-budget-seconds 3600 \
   --json
 ```
 
-Harvests store page state and advance the `(metadata_prefix, set_spec)`
-watermark only after every resumption-token page succeeds. If a harvest stops
-after receiving a token, rerunning the same command continues from the saved
-token. Use `--resumption-token` to continue from a specific token.
+Harvests store every page, cumulative count, next token, request count, and
+deadline atomically, and advance the `(metadata_prefix, set_spec)` watermark
+only after every page succeeds. All initial and incremental jobs capable of
+writing the same watermark share one process lease, and watermark values never
+move backward. If a harvest stops, rerunning the same command resumes the
+running job without replaying committed pages. The three budget flags are
+persisted with the job and checked before each network request. Use
+`--resumption-token` to begin from a specific token.
+
+## Adaptive Rate-Limit Policy
+
+HTTP 429 and OAI `503 + Retry-After` share the durable cooldown but have
+separate counters. Consecutive responses multiply the base cooldown by 2 up to
+24 hours; `Retry-After` can extend that value and random jitter adds at most 60
+seconds. Jitter never shortens the wait. A successful request resets the
+consecutive counter.
+
+The corresponding environment variables are
+`HULDRA_RATE_LIMIT_BACKOFF_MULTIPLIER`,
+`HULDRA_RATE_LIMIT_MAX_COOLDOWN_SECONDS`, and
+`HULDRA_RATE_LIMIT_JITTER_SECONDS`. Keep the API and worker on the same database
+so every process observes the same lease and cooldown.
 
 ## systemd User Service
 
@@ -196,6 +227,27 @@ Stop the API and worker, then copy the SQLite files:
 ```bash
 cp ~/.local/share/huldra/huldra.db* /path/to/backup/
 ```
+
+### Upgrade An Existing Store
+
+Keep the API and worker stopped after making the backup. Install the new Huldra
+revision, then initialize the existing database once; initialization applies
+additive schema migrations before either process starts:
+
+```bash
+uv run huldra store init --db ~/.local/share/huldra/huldra.db
+uv run huldra status --db ~/.local/share/huldra/huldra.db --json
+```
+
+Confirm the status command succeeds and reports the expected paper/cache counts,
+then restart the API and worker. Do not let old and new Huldra processes share
+the database during the upgrade.
+
+For rollback, stop both processes, restore the complete pre-upgrade SQLite file
+set, deploy the previous Huldra revision, and start the API and worker again.
+Restoring the backup is required even when a release describes its migrations
+as additive; it keeps binary and schema state from different releases from
+being mixed during an incident.
 
 Preview rows older than 30 days that are eligible for cleanup:
 

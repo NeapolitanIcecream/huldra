@@ -64,6 +64,8 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
             wait=request.wait,
             wait_timeout_seconds=request.wait_timeout_seconds,
             mode=request.mode,
+            max_pages_per_window=request.max_pages_per_window,
+            max_requests_total=request.max_requests_total,
         )
 
     @app.post("/v1/backfill", response_model=HuldraMaintenanceResult)
@@ -77,6 +79,8 @@ def create_app(settings: HuldraSettings | None = None) -> FastAPI:
             wait_timeout_seconds=request.wait_timeout_seconds,
             mode=request.mode,
             client_id=request.client_id,
+            max_pages_per_window=request.max_pages_per_window,
+            max_requests_total=request.max_requests_total,
         )
 
     @app.post("/v1/harvest/oai", response_model=OaiHarvestResult)

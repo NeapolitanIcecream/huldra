@@ -66,9 +66,10 @@ Check status:
 uv run huldra status --db ~/.local/share/huldra/huldra.db --json
 ```
 
-Status includes queue depth, cache totals, durable upstream 429 totals,
-cooldown state, worker heartbeat, worker next wake, the last worker error, and
-row counts for events, queue history, sync jobs, and sync-job pages.
+Status includes queue depth, cache totals, separate durable HTTP 429 and OAI
+`503 + Retry-After` totals, adaptive cooldown state, last-request timing,
+worker heartbeat, worker next wake, the last worker error, and row counts for
+events, queue history, sync jobs, and sync-job pages.
 
 Preview retention cleanup without deleting anything:
 
@@ -131,7 +132,8 @@ uv run huldra sync \
 ```
 
 Fetch every legacy search page for a bounded window by opting into complete
-window mode:
+window mode. The request budget is persisted with queued work and counts actual
+upstream attempts, including retries:
 
 ```bash
 uv run huldra sync \
@@ -140,6 +142,8 @@ uv run huldra sync \
   --date 2026-05-20 \
   --max-results 60 \
   --mode complete-window \
+  --max-pages-per-window 100 \
+  --max-requests-total 500 \
   --wait \
   --json
 ```
@@ -153,6 +157,8 @@ uv run huldra backfill \
   --start-date 2026-05-01 \
   --end-date 2026-05-20 \
   --max-results 60 \
+  --max-pages-per-window 100 \
+  --max-requests-total 500 \
   --json
 ```
 
@@ -164,6 +170,9 @@ uv run huldra harvest oai \
   --metadata-prefix arXiv \
   --set cs:cs:AI \
   --mode incremental \
+  --max-pages 1000 \
+  --max-requests 1000 \
+  --runtime-budget-seconds 3600 \
   --json
 ```
 
@@ -253,9 +262,19 @@ Huldra keeps all arXiv legacy API access behind one durable limiter. The default
 request interval is 5 seconds, which is more conservative than arXiv's 3 second
 minimum. Only one upstream fetch lease can be held at a time.
 
-When arXiv returns HTTP 429, Huldra persists `cooldown_until` in SQLite. New
+When arXiv returns HTTP 429, or the OAI endpoint returns `503` with
+`Retry-After`, Huldra persists `cooldown_until` in SQLite. `Retry-After` is a
+hard lower bound. Consecutive rate-limit responses multiply the configured
+cooldown by 2, up to 24 hours by default, and add only upward jitter of up to
+60 seconds. A successful upstream request resets the consecutive counter. New
 requests can still be queued, but workers will not probe upstream again until
 the cooldown expires.
+
+Tune the policy with `HULDRA_COOLDOWN_SECONDS`,
+`HULDRA_RATE_LIMIT_BACKOFF_MULTIPLIER`,
+`HULDRA_RATE_LIMIT_MAX_COOLDOWN_SECONDS`, and
+`HULDRA_RATE_LIMIT_JITTER_SECONDS`. The cap must remain at least as large as
+the cooldown and request-interval safety floor.
 
 ## OAI-PMH Harvesting
 
@@ -263,10 +282,15 @@ The OAI-PMH surface uses `https://oaipmh.arxiv.org/oai` by default and stores
 harvest jobs, page state, watermarks, raw OAI records, deleted headers, and
 normalized paper metadata. Incremental harvests use the last successful server
 response date or datestamp watermark unless `--from` is provided explicitly.
-Watermarks advance only after all pages in the harvest succeed. If a harvest
-stops after receiving a resumption token, rerun the same harvest and Huldra will
-continue from the saved token. To continue from a specific token, pass
-`--resumption-token`.
+Watermarks advance only after all pages in the harvest succeed. Each page,
+next token, cumulative counter, request count, and deadline is checkpointed in
+the same SQLite transaction. If a process stops, rerun the same harvest and
+Huldra resumes the running job without refetching committed pages. Page,
+request, and runtime budgets stop the job before the next network request;
+repeated tokens, token cycles, and no-progress pages fail deterministically.
+Initial and incremental jobs that can write the same watermark share one lease,
+and watermark updates are monotonic.
+To continue from a specific token, pass `--resumption-token`.
 
 Use legacy search for request-sized slices and complete-window maintenance.
 Use OAI-PMH for full mirrors, category-scoped mirrors, and datestamp-based

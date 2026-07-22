@@ -76,11 +76,20 @@ def test_fetcher_429_integer_retry_after(settings: HuldraSettings) -> None:
             ArxivRequest(client_id="demo", search_query="cat:cs.AI")
         )
     assert exc.value.retry_after_seconds == 42
+    assert exc.value.rate_limit_kind == "http_429"
+    assert exc.value.api_family == "legacy_api"
 
 
 def test_parse_retry_after_http_date() -> None:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     target = now + timedelta(seconds=30)
+    assert _parse_retry_after_seconds(format_datetime(target), now=now) == 30
+
+
+def test_parse_retry_after_http_date_never_rounds_below_the_server_boundary() -> None:
+    now = datetime(2026, 1, 1, 0, 0, 0, 500_000, tzinfo=UTC)
+    target = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+
     assert _parse_retry_after_seconds(format_datetime(target), now=now) == 30
 
 

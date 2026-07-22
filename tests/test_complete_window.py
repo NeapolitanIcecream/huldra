@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import pytest
 
+import huldra.broker as broker_module
+import huldra.db as db_module
+import huldra.limiter as limiter_module
+import huldra.worker as worker_module
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import FetchResult, NonRetryableFetchError
-from huldra.models import ArxivRequest, CoverageStatus, LegacySyncMode
+from huldra.fetcher import FetchResult, NonRetryableFetchError, TransientFetchError
+from huldra.keys import request_cache_key
+from huldra.models import (
+    ArxivRequest,
+    CoverageStatus,
+    LegacySyncMode,
+    QueueItem,
+    QueueWorkKind,
+)
+from huldra.worker import HuldraWorker
 from tests.conftest import make_paper
 
 
@@ -182,3 +196,327 @@ def test_complete_window_failed_middle_page_keeps_window_partial(
     assert result.requests[0].pages_total == 3
     assert result.requests[0].pages_completed_total == 2
     assert [seen.start for seen in fetcher.seen] == [0, 1, 2]
+
+
+def test_complete_window_page_budget_stops_before_followup_enqueue(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """A tiny first page must not fan out into thousands of durable requests."""
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    fetcher = CapturingFetcher(
+        [FetchResult([make_paper("2401.00001v1")], total_results=9_999)],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=30,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=10,
+        max_requests_total=10,
+    )
+
+    assert [seen.start for seen in fetcher.seen] == [0]
+    assert result.requests[0].raw_cache_status == "partial"
+    assert result.requests[0].error_category == "page_budget_exceeded"
+    assert store.status_summary().queue_depth_total == 0
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sync_job_pages").fetchone()[0] == 1
+
+
+def test_complete_window_deadline_stops_before_followup_enqueue(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    fetcher = CapturingFetcher(
+        [FetchResult([make_paper("2401.00001v1")], total_results=3)],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=1,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=10,
+        max_requests_total=10,
+    )
+
+    assert [seen.start for seen in fetcher.seen] == [0]
+    assert result.requests[0].error_category == "deadline_budget_exceeded"
+    assert store.status_summary().queue_depth_total == 0
+
+
+def test_backfill_request_budget_rejects_before_creating_jobs(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    broker = HuldraBroker(store=store, settings=settings)
+
+    with pytest.raises(ValueError, match="request budget"):
+        broker.backfill_windows(
+            search_queries=["cat:cs.AI", "cat:cs.LG"],
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 3),
+            max_results=1,
+            wait=True,
+            mode=LegacySyncMode.COMPLETE_WINDOW,
+            max_requests_total=5,
+        )
+
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sync_jobs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM queue_items").fetchone()[0] == 0
+
+
+def test_complete_window_rechecks_deadline_before_initial_enqueue(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    monotonic_now = [0.0]
+    monkeypatch.setattr(broker_module.time, "monotonic", lambda: monotonic_now[0])
+    original_create = store.create_sync_job
+
+    def create_after_deadline(
+        job_request: ArxivRequest,
+        job_mode: LegacySyncMode,
+        *,
+        upstream_budget_id: str | None = None,
+    ) -> str:
+        sync_job_id = original_create(
+            job_request,
+            job_mode,
+            upstream_budget_id=upstream_budget_id,
+        )
+        monotonic_now[0] = 2.0
+        return sync_job_id
+
+    monkeypatch.setattr(store, "create_sync_job", create_after_deadline)
+
+    result = HuldraBroker(store=store, settings=settings).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=1,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    assert result.requests[0].error_category == "deadline_budget_exceeded"
+    with store.connect() as conn:
+        active = conn.execute(
+            "SELECT COUNT(*) FROM queue_items "
+            "WHERE status IN ('queued', 'delayed', 'claimed')"
+        ).fetchone()[0]
+    assert active == 0
+
+
+def test_complete_window_rechecks_deadline_after_rate_wait_before_network(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wall_now = [datetime(2026, 7, 22, 12, 0, tzinfo=UTC)]
+    elapsed = [0.0]
+
+    def now() -> datetime:
+        return wall_now[0]
+
+    def monotonic() -> float:
+        return elapsed[0]
+
+    def oversleep(seconds: float) -> None:
+        wall_now[0] += timedelta(seconds=seconds + 2)
+        elapsed[0] += seconds + 2
+
+    monkeypatch.setattr(broker_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(broker_module.time, "sleep", oversleep)
+    monkeypatch.setattr(broker_module, "utc_now", now)
+    monkeypatch.setattr(db_module, "utc_now", now)
+    monkeypatch.setattr(limiter_module, "utc_now", now)
+    monkeypatch.setattr(worker_module, "utc_now", now)
+    store.set_rate_state(store.get_rate_state().model_copy(update={"last_request_at": now()}))
+    fetcher = CapturingFetcher([FetchResult([make_paper()], total_results=1)], [])
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)],
+        wait=True,
+        wait_timeout_seconds=4,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    assert fetcher.seen == []
+    assert result.upstream_requests_total == 0
+    assert result.requests[0].error_category == "deadline_budget_exceeded"
+
+
+def test_complete_window_request_budget_caps_retried_upstream_attempts(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    first_fetcher = CapturingFetcher([TransientFetchError("temporary", status_code=500)], [])
+
+    HuldraBroker(store=store, settings=settings, fetcher=first_fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=30,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+    assert len(first_fetcher.seen) == 1
+
+    old = "2000-01-01T00:00:00+00:00"
+    with store.begin_immediate() as conn:
+        conn.execute(
+            "UPDATE queue_items SET next_attempt_at = ? WHERE status = 'delayed'",
+            (old,),
+        )
+        conn.execute(
+            "UPDATE rate_state SET last_request_at = ?, last_request_started_at = ? "
+            "WHERE name = 'arxiv_legacy_api'",
+            (old, old),
+        )
+    retry_fetcher = CapturingFetcher([FetchResult([make_paper()], total_results=1)], [])
+
+    retry = HuldraWorker(store, settings, fetcher=retry_fetcher).run_once()
+
+    assert retry.status == "budget_exceeded"
+    assert retry.error_category == "request_budget_exceeded"
+    assert retry_fetcher.seen == []
+    entry = store.get_cache_entry(request_cache_key(request))
+    assert entry is not None
+    assert entry.upstream_requests_total == 1
+
+
+def test_complete_window_rechecks_deadline_before_each_followup_enqueue(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    store.record_completed_cache_entry(
+        cache_key=request_cache_key(request),
+        request=request,
+        papers=[make_paper()],
+        total_results=3,
+    )
+    monotonic_now = [0.0]
+    monkeypatch.setattr(broker_module.time, "monotonic", lambda: monotonic_now[0])
+    original_record_page = store.record_sync_job_page
+    original_enqueue = store.enqueue_request_for_work
+    enqueued_at: list[tuple[int, float]] = []
+
+    def record_page_then_expire(
+        *,
+        sync_job_id: str,
+        request: ArxivRequest,
+        cache_key: str,
+        status: str,
+        result_count: int = 0,
+        total_results: int | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        original_record_page(
+            sync_job_id=sync_job_id,
+            request=request,
+            cache_key=cache_key,
+            status=status,
+            result_count=result_count,
+            total_results=total_results,
+            diagnostics=diagnostics,
+        )
+        if request.start > 0:
+            monotonic_now[0] = 20.0
+
+    def capture_enqueue(
+        request: ArxivRequest,
+        cache_key: str | None = None,
+        *,
+        work_kind: QueueWorkKind | None = None,
+        upstream_budget_id: str | None = None,
+    ) -> tuple[QueueItem, bool]:
+        enqueued_at.append((request.start, monotonic_now[0]))
+        return original_enqueue(
+            request,
+            cache_key,
+            work_kind=work_kind,
+            upstream_budget_id=upstream_budget_id,
+        )
+
+    monkeypatch.setattr(store, "record_sync_job_page", record_page_then_expire)
+    monkeypatch.setattr(store, "enqueue_request_for_work", capture_enqueue)
+
+    result = HuldraBroker(store=store, settings=settings).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=10,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=10,
+        max_requests_total=10,
+    )
+
+    assert enqueued_at == []
+    assert result.requests[0].error_category == "deadline_budget_exceeded"
+    with store.connect() as conn:
+        pages = conn.execute(
+            "SELECT start, status FROM sync_job_pages ORDER BY start"
+        ).fetchall()
+    assert [tuple(page) for page in pages] == [(0, "completed")]
+
+
+def test_complete_window_rechecks_deadline_after_budget_reservation_before_network(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wall_now = [datetime(2026, 7, 22, 12, 0, tzinfo=UTC)]
+    elapsed = [0.0]
+
+    def now() -> datetime:
+        return wall_now[0]
+
+    monkeypatch.setattr(broker_module.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(broker_module, "utc_now", now)
+    monkeypatch.setattr(db_module, "utc_now", now)
+    monkeypatch.setattr(limiter_module, "utc_now", now)
+    monkeypatch.setattr(worker_module, "utc_now", now)
+    original_reserve = store.reserve_upstream_request
+
+    def reserve_then_expire(
+        budget_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        outcome = original_reserve(budget_id, now=now)
+        wall_now[0] += timedelta(seconds=5)
+        elapsed[0] += 5
+        return outcome
+
+    monkeypatch.setattr(store, "reserve_upstream_request", reserve_then_expire)
+    fetcher = CapturingFetcher([FetchResult([make_paper()], total_results=1)], [])
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)],
+        wait=True,
+        wait_timeout_seconds=4,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    assert fetcher.seen == []
+    assert result.upstream_requests_total == 0
+    assert result.requests[0].error_category == "deadline_budget_exceeded"

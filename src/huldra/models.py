@@ -81,6 +81,7 @@ class ArxivRequest(HuldraModel):
     maturity_lag_days: int | None = None
     priority: int = 0
     timeout_seconds: float | None = Field(default=None, gt=0)
+    refresh_interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)
     api_family: ApiFamily = "legacy_search"
 
     @field_validator("client_id")
@@ -179,8 +180,18 @@ class RateState(HuldraModel):
     cooldown_until: datetime | None = None
     consecutive_429_total: int = 0
     upstream_429_total: int = 0
+    consecutive_rate_limit_total: int = 0
+    upstream_rate_limited_total: int = 0
+    upstream_oai_503_retry_after_total: int = 0
     last_status: int | None = None
     last_error_message: str | None = None
+    last_request_started_at: datetime | None = None
+    last_rate_wait_seconds: float | None = None
+    last_request_latency_ms: float | None = None
+    last_retry_after_seconds: int | None = None
+    last_effective_cooldown_seconds: float | None = None
+    last_rate_limit_kind: str | None = None
+    last_api_family: str | None = None
 
 
 class QueueItem(HuldraModel):
@@ -191,6 +202,7 @@ class QueueItem(HuldraModel):
     priority: int
     status: RequestStatus
     work_kind: QueueWorkKind = QueueWorkKind.FETCH_MISSING
+    upstream_budget_id: str | None = None
     created_at: datetime
     updated_at: datetime
     claimed_by: str | None = None
@@ -209,6 +221,7 @@ class CacheEntry(HuldraModel):
     status: str
     requested_at: datetime | None = None
     completed_at: datetime | None = None
+    refresh_after: datetime | None = None
     cooldown_until: datetime | None = None
     upstream_status: int | None = None
     upstream_requests_total: int = 0
@@ -222,8 +235,18 @@ class CacheEntry(HuldraModel):
 class BrokerStatus(HuldraResponseModel):
     upstream_requests_total: int = 0
     upstream_429_total: int = 0
+    upstream_rate_limited_total: int = 0
+    upstream_oai_503_retry_after_total: int = 0
+    consecutive_rate_limit_total: int = 0
     cooldown_until: datetime | None = None
     cooldown_active: bool = False
+    last_request_started_at: datetime | None = None
+    last_rate_wait_seconds: float | None = None
+    last_request_latency_ms: float | None = None
+    last_retry_after_seconds: int | None = None
+    last_effective_cooldown_seconds: float | None = None
+    last_rate_limit_kind: str | None = None
+    last_api_family: str | None = None
     queue_depth_total: int = 0
     queue_ready_total: int = 0
     queue_delayed_total: int = 0
@@ -289,6 +312,7 @@ class ArxivResult(HuldraResponseModel):
     error_category: str | None = None
     error_message: str | None = None
     completed_at: datetime | None = None
+    refresh_after: datetime | None = None
     queued_at: datetime | None = None
     upstream_status: int | None = None
 
@@ -351,6 +375,7 @@ class HuldraMaintenanceResult(HuldraResponseModel):
     skipped_windows_total: int = 0
     rate_limited_windows_total: int = 0
     failed_windows_total: int = 0
+    budget_exhausted_windows_total: int = 0
     papers_total: int = 0
     cooldown_active: bool = False
     cooldown_until: datetime | None = None
@@ -362,11 +387,15 @@ class HuldraSyncRequest(HuldraModel):
     wait: bool = False
     wait_timeout_seconds: float | None = Field(default=None, gt=0)
     mode: LegacySyncMode = LegacySyncMode.SLICE
+    max_pages_per_window: int = Field(default=100, ge=1, le=10_000)
+    max_requests_total: int = Field(default=500, ge=1, le=100_000)
 
     @model_validator(mode="after")
     def _complete_window_requires_wait(self) -> HuldraSyncRequest:
         if self.mode == LegacySyncMode.COMPLETE_WINDOW and not self.wait:
             raise ValueError("complete_window mode requires wait=True")
+        if len(self.requests) > self.max_requests_total:
+            raise ValueError("sync request exceeds request budget")
         return self
 
 
@@ -379,6 +408,8 @@ class HuldraBackfillRequest(HuldraModel):
     wait_timeout_seconds: float | None = Field(default=None, gt=0)
     mode: LegacySyncMode = LegacySyncMode.SLICE
     client_id: str = "huldra-backfill"
+    max_pages_per_window: int = Field(default=100, ge=1, le=10_000)
+    max_requests_total: int = Field(default=500, ge=1, le=100_000)
 
     @field_validator("search_queries")
     @classmethod
@@ -402,6 +433,9 @@ class HuldraBackfillRequest(HuldraModel):
             raise ValueError("start_date must be on or before end_date")
         if self.mode == LegacySyncMode.COMPLETE_WINDOW and not self.wait:
             raise ValueError("complete_window mode requires wait=True")
+        windows_total = (self.end_date - self.start_date).days + 1
+        if windows_total * len(self.search_queries) > self.max_requests_total:
+            raise ValueError("backfill plan exceeds request budget")
         return self
 
 
@@ -416,6 +450,9 @@ class OaiHarvestRequest(HuldraModel):
     cache_policy: CachePolicy = CachePolicy.CACHE_OR_ENQUEUE
     priority: int = 0
     timeout_seconds: float | None = Field(default=None, gt=0)
+    max_pages: int = Field(default=1000, ge=1, le=100_000)
+    max_requests: int = Field(default=1000, ge=1, le=100_000)
+    runtime_budget_seconds: float = Field(default=3600.0, gt=0, le=604_800)
 
     @field_validator("client_id")
     @classmethod
@@ -462,10 +499,12 @@ class OaiHarvestResult(HuldraResponseModel):
     papers_upserted: int = 0
     deleted_records: int = 0
     pages_total: int = 0
+    requests_total: int = 0
     current_watermark: str | None = None
     resumption_token: str | None = None
     error_category: str | None = None
     error_message: str | None = None
+    deadline_at: datetime | None = None
 
 
 def utc_day_floor(value: datetime) -> datetime:

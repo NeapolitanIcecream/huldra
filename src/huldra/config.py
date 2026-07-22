@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from platformdirs import user_data_dir
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from huldra import __version__
@@ -21,6 +21,9 @@ class HuldraSettings(BaseSettings):
     api_port: int = 8765
     request_interval_seconds: float = 5.0
     cooldown_seconds: int = 3600
+    rate_limit_backoff_multiplier: float = Field(default=2.0, ge=1.0)
+    rate_limit_max_cooldown_seconds: float = Field(default=86400.0, gt=0.0)
+    rate_limit_jitter_seconds: float = Field(default=60.0, ge=0.0)
     request_timeout_seconds: float = 30.0
     worker_poll_interval_seconds: float = Field(default=300.0, ge=1.0)
     lease_timeout_seconds: int = 120
@@ -72,3 +75,12 @@ class HuldraSettings(BaseSettings):
         if value < 0:
             raise ValueError("oai_overlap_seconds cannot be negative")
         return value
+
+    @model_validator(mode="after")
+    def _rate_limit_cap_covers_safety_floor(self) -> HuldraSettings:
+        safety_floor = max(float(self.cooldown_seconds), self.request_interval_seconds)
+        if self.rate_limit_max_cooldown_seconds < safety_floor:
+            raise ValueError(
+                "rate_limit_max_cooldown_seconds must be at least the max cooldown safety floor"
+            )
+        return self
