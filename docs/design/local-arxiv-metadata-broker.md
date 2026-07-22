@@ -19,8 +19,10 @@ Huldra keeps these state surfaces in one SQLite database:
 
 - Shared cache: completed metadata responses and paper matches.
 - Queue: pending work keyed by normalized request fingerprints.
-- Durable limiter: `last_request_at` and upstream status.
-- Cooldown: persisted `cooldown_until` after HTTP 429.
+- Durable limiter: request timing, upstream status, and separate 429/OAI-503
+  counters.
+- Cooldown: adaptive persisted `cooldown_until` after HTTP 429 or OAI
+  `503 + Retry-After`.
 - Lease: one `upstream_fetch` holder so local workers do not open concurrent
   arXiv API connections.
 
@@ -65,6 +67,10 @@ Huldra through the CLI, Python client, or local HTTP API.
   and an upstream lease.
 - HTTP 429 persists `cooldown_until`; workers do not keep probing upstream while
   cooldown is active.
+- OAI pages and budgets checkpoint atomically, and same-scope harvests are
+  single-flight across local processes.
+- Complete-window and backfill expansion stops at explicit page and request
+  budgets before more work is queued.
 - Tests use fake fetchers or `httpx.MockTransport`, never the real arXiv API.
 - The repository has no Python runtime imports from Recoleta in `src/` or
   `tests/`.

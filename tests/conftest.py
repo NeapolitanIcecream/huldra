@@ -16,6 +16,7 @@ def settings(tmp_path: Path) -> HuldraSettings:
         db_path=tmp_path / "huldra.db",
         request_interval_seconds=3.0,
         cooldown_seconds=60,
+        rate_limit_jitter_seconds=0.0,
         worker_poll_interval_seconds=1.0,
         request_timeout_seconds=0.2,
     )

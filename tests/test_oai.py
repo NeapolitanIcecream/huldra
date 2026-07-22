@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 import httpx
 import pytest
 
+import huldra.broker as broker_module
+import huldra.db as db_module
+import huldra.limiter as limiter_module
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
@@ -237,6 +246,7 @@ class FakeOaiFetcher:
         from_datestamp: str | None = None,
         until_datestamp: str | None = None,
         resumption_token: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> OaiPmhPage:
         self.seen.append(
             {
@@ -245,6 +255,7 @@ class FakeOaiFetcher:
                 "from_datestamp": from_datestamp,
                 "until_datestamp": until_datestamp,
                 "resumption_token": resumption_token,
+                "timeout_seconds": timeout_seconds,
             }
         )
         response = self.responses.pop(0)
@@ -354,6 +365,44 @@ def test_oai_fetcher_503_retry_after_enters_rate_limit_flow(settings: HuldraSett
         OaiPmhFetcher(settings, client=client).list_records(metadata_prefix="arXiv")
 
     assert exc.value.retry_after_seconds == 42
+    assert exc.value.rate_limit_kind == "oai_503_retry_after"
+    assert exc.value.api_family == "oai_pmh"
+
+
+def test_oai_fetcher_429_stays_a_true_429_rate_limit(settings: HuldraSettings) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(429, headers={"Retry-After": "42"})
+        )
+    )
+
+    with pytest.raises(RateLimitedError) as exc:
+        OaiPmhFetcher(settings, client=client).list_records(metadata_prefix="arXiv")
+
+    assert exc.value.status_code == 429
+    assert exc.value.retry_after_seconds == 42
+    assert exc.value.rate_limit_kind == "http_429"
+    assert exc.value.api_family == "oai_pmh"
+
+
+def test_oai_fetcher_caps_http_timeout_to_remaining_runtime(
+    settings: HuldraSettings,
+) -> None:
+    observed_timeouts: list[dict[str, float]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        observed_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, text=OAI_NO_RECORDS_MATCH)
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+
+    OaiPmhFetcher(settings, client=client).list_records(
+        metadata_prefix="arXiv",
+        timeout_seconds=0.05,
+    )
+
+    assert len(observed_timeouts) == 1
+    assert set(observed_timeouts[0].values()) == {0.05}
 
 
 def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
@@ -439,6 +488,10 @@ def test_oai_harvest_503_retry_after_persists_shared_cooldown(
     assert "cooldown_until=" in result.error_message
     assert rate_state.cooldown_until is not None
     assert rate_state.last_status == 503
+    status = store.status_summary()
+    assert status.upstream_429_total == 0
+    assert status.upstream_rate_limited_total == 1
+    assert status.upstream_oai_503_retry_after_total == 1
 
 
 def test_oai_harvest_delay_is_shared_with_legacy_worker(
@@ -701,6 +754,9 @@ def test_oai_harvest_auto_resumes_pending_token_after_rate_limit(
     assert interrupted.resumption_token == "next-token"
     assert interrupted_fetcher.seen[1]["resumption_token"] == "next-token"
 
+    rate = store.get_rate_state()
+    store.set_rate_state(rate.model_copy(update={"cooldown_until": None}))
+
     resume_fetcher = FakeOaiFetcher([final], [])
     resumed = HuldraBroker(
         store=store,
@@ -730,6 +786,823 @@ def test_oai_harvest_auto_resumes_pending_token_after_rate_limit(
 
     assert fresh.status == "completed"
     assert fresh_fetcher.seen[0]["resumption_token"] is None
+
+
+def test_oai_running_harvest_resumes_from_atomic_page_checkpoint(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    first = parse_oai_pmh_list_records(OAI_PAGE)
+    final = parse_oai_pmh_list_records(OAI_DELETED_PAGE)
+    crashed_fetcher = FakeOaiFetcher([first, RuntimeError("simulated process crash")], [])
+    request = OaiHarvestRequest(
+        client_id="test",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+        max_pages=10,
+        max_requests=10,
+        runtime_budget_seconds=60,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        HuldraBroker(
+            store=store,
+            settings=settings,
+            oai_fetcher=crashed_fetcher,
+        ).harvest_oai(request)
+
+    with store.begin_immediate() as conn:
+        conn.execute("DELETE FROM leases")
+        checkpoint = conn.execute(
+            "SELECT harvest_id, status, pages_total, resumption_token FROM oai_harvest_jobs"
+        ).fetchone()
+    assert checkpoint is not None
+    assert checkpoint["status"] == "running"
+    assert checkpoint["pages_total"] == 1
+    assert checkpoint["resumption_token"] == "next-token"
+
+    resumed_fetcher = FakeOaiFetcher([final], [])
+    resumed = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=resumed_fetcher,
+    ).harvest_oai(request)
+
+    assert resumed.harvest_id == checkpoint["harvest_id"]
+    assert resumed.status == "completed"
+    assert resumed.pages_total == 2
+    assert resumed.records_processed == 2
+    assert resumed_fetcher.seen[0]["resumption_token"] == "next-token"
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM oai_harvest_jobs").fetchone()[0] == 1
+
+
+def test_oai_explicit_token_does_not_recover_running_job_at_other_cursor(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    crashed_request = OaiHarvestRequest(
+        client_id="crashed",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+    )
+    crashed_harvest_id = store.create_oai_harvest_job(
+        crashed_request,
+        resumption_token="crashed-token",
+    )
+    fetcher = FakeOaiFetcher(
+        [parse_oai_pmh_list_records(OAI_DELETED_PAGE)],
+        [],
+    )
+
+    result = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="manual",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            resumption_token="caller-token",
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.harvest_id != crashed_harvest_id
+    assert fetcher.seen[0]["resumption_token"] == "caller-token"
+
+
+def test_oai_repeated_resumption_token_fails_without_refetch_loop(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    page = replace(parse_oai_pmh_list_records(OAI_PAGE), resumption_token="loop-token")
+    fetcher = FakeOaiFetcher([page], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            resumption_token="loop-token",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_category == "repeated_resumption_token"
+    assert len(fetcher.seen) == 1
+
+
+def test_oai_invalid_token_checkpoint_crash_does_not_refetch_invalid_cursor(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(broker_module.time, "sleep", lambda _seconds: None)
+    invalid = OaiPmhPage(
+        records=[],
+        response_date="2026-07-22T00:00:00Z",
+        resumption_token="loop-token",
+        errors=[],
+        request_params={},
+    )
+    request = OaiHarvestRequest(
+        client_id="test",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+        resumption_token="loop-token",
+        max_pages=10,
+        max_requests=10,
+    )
+    original_checkpoint = store.checkpoint_oai_page
+
+    def checkpoint_then_crash(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
+        original_checkpoint(*args, **kwargs)
+        store.checkpoint_oai_page = original_checkpoint  # type: ignore[method-assign]
+        raise RuntimeError("simulated crash after invalid cursor checkpoint")
+
+    store.checkpoint_oai_page = checkpoint_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        HuldraBroker(
+            store=store,
+            settings=settings,
+            oai_fetcher=FakeOaiFetcher([invalid], []),
+        ).harvest_oai(request)
+
+    with store.connect() as conn:
+        checkpoint = conn.execute(
+            "SELECT status, error_category, resumption_token FROM oai_harvest_jobs"
+        ).fetchone()
+    assert checkpoint is not None
+    assert checkpoint["status"] == "running"
+    assert checkpoint["error_category"] == "repeated_resumption_token"
+    assert checkpoint["resumption_token"] == "loop-token"
+
+    resumed_fetcher = FakeOaiFetcher([], [])
+    resumed = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=resumed_fetcher,
+    ).harvest_oai(request)
+
+    assert resumed.status == "failed"
+    assert resumed.error_category == "repeated_resumption_token"
+    assert resumed_fetcher.seen == []
+
+
+def test_oai_resumption_token_cycle_is_bounded(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    first = replace(parse_oai_pmh_list_records(OAI_PAGE), resumption_token="token-a")
+    second = replace(parse_oai_pmh_list_records(OAI_DELETED_PAGE), resumption_token="token-b")
+    third = replace(parse_oai_pmh_list_records(OAI_DELETED_PAGE), resumption_token="token-a")
+    fetcher = FakeOaiFetcher([first, second, third], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    assert result.status == "failed"
+    assert result.error_category == "resumption_token_cycle"
+    assert len(fetcher.seen) == 3
+
+
+def test_oai_empty_page_with_continuation_token_fails_as_no_progress(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    page = OaiPmhPage(
+        records=[],
+        response_date="2026-05-28T00:00:00Z",
+        resumption_token="next-token",
+        errors=[],
+        request_params={},
+    )
+    fetcher = FakeOaiFetcher([page], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(client_id="test", metadata_prefix="arXiv", mode=OaiHarvestMode.INITIAL)
+    )
+
+    assert result.status == "failed"
+    assert result.error_category == "no_progress"
+    assert len(fetcher.seen) == 1
+
+
+def test_oai_request_budget_stops_before_next_fetch(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    first = parse_oai_pmh_list_records(OAI_PAGE)
+    fetcher = FakeOaiFetcher([first], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            max_pages=10,
+            max_requests=1,
+            runtime_budget_seconds=60,
+        )
+    )
+
+    assert result.status == "budget_exceeded"
+    assert result.error_category == "request_budget_exceeded"
+    assert result.pages_total == 1
+    assert result.requests_total == 1
+    assert len(fetcher.seen) == 1
+
+
+def test_oai_expired_runtime_budget_stops_before_fetch(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = OaiHarvestRequest(
+        client_id="test",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+        runtime_budget_seconds=60,
+    )
+    harvest_id = store.create_oai_harvest_job(request)
+    with store.begin_immediate() as conn:
+        conn.execute(
+            "UPDATE oai_harvest_jobs SET deadline_at='2000-01-01T00:00:00+00:00' "
+            "WHERE harvest_id=?",
+            (harvest_id,),
+        )
+    fetcher = FakeOaiFetcher([], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(request)
+
+    assert result.harvest_id == harvest_id
+    assert result.status == "budget_exceeded"
+    assert result.error_category == "runtime_budget_exceeded"
+    assert fetcher.seen == []
+
+
+def test_oai_harvest_caps_each_request_to_remaining_runtime(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    clock = _OaiAuditClock(started)
+    monkeypatch.setattr(broker_module, "utc_now", clock.now)
+    monkeypatch.setattr(db_module, "utc_now", clock.now)
+    monkeypatch.setattr(limiter_module, "utc_now", clock.now)
+    original_started = store.record_oai_request_started
+    original_renew = store.renew_leases_if_owned
+
+    def account_with_delay(harvest_id: str) -> int:
+        requests_total = original_started(harvest_id)
+        clock.current += timedelta(seconds=1)
+        return requests_total
+
+    def renew_with_delay(
+        leases: tuple[tuple[str, str, int], ...],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        renewed = original_renew(leases, now=now)
+        if len(leases) == 2:
+            clock.current += timedelta(seconds=2)
+        return renewed
+
+    monkeypatch.setattr(store, "record_oai_request_started", account_with_delay)
+    monkeypatch.setattr(store, "renew_leases_if_owned", renew_with_delay)
+    fetcher = FakeOaiFetcher([parse_oai_pmh_list_records(OAI_DELETED_PAGE)], [])
+    tuned = settings.model_copy(update={"request_timeout_seconds": 30.0})
+
+    result = HuldraBroker(
+        store=store,
+        settings=tuned,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            runtime_budget_seconds=4,
+            max_pages=1,
+            max_requests=1,
+        )
+    )
+
+    assert result.status == "completed"
+    assert fetcher.seen[0]["timeout_seconds"] == 1.0
+
+
+def test_oai_running_harvest_backfills_missing_deadline_once(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = OaiHarvestRequest(
+        client_id="test",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+        runtime_budget_seconds=60,
+    )
+    harvest_id = store.create_oai_harvest_job(request)
+    with store.begin_immediate() as conn:
+        conn.execute(
+            "UPDATE oai_harvest_jobs SET deadline_at=NULL WHERE harvest_id=?",
+            (harvest_id,),
+        )
+    fetcher = FakeOaiFetcher([parse_oai_pmh_list_records(OAI_DELETED_PAGE)], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(request)
+
+    assert result.harvest_id == harvest_id
+    assert result.status == "completed"
+    assert result.deadline_at is not None
+    with store.connect() as conn:
+        deadline = conn.execute(
+            "SELECT deadline_at FROM oai_harvest_jobs WHERE harvest_id=?",
+            (harvest_id,),
+        ).fetchone()[0]
+    assert deadline == result.deadline_at.isoformat()
+
+
+@dataclass
+class _OaiAuditClock:
+    current: datetime
+
+    def now(self) -> datetime:
+        return self.current
+
+    def oversleep(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds + 2)
+
+
+@dataclass
+class _TimedEmptyOaiFetcher:
+    clock: _OaiAuditClock
+    calls_at: list[datetime]
+
+    def list_records(self, **_kwargs: object) -> OaiPmhPage:
+        self.calls_at.append(self.clock.now())
+        return OaiPmhPage(
+            records=[],
+            response_date="2026-07-22T00:00:00Z",
+            resumption_token=None,
+            errors=[],
+            request_params={},
+        )
+
+
+def test_oai_rechecks_deadline_after_rate_wait_before_network(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    clock = _OaiAuditClock(started)
+    monkeypatch.setattr(broker_module, "utc_now", clock.now)
+    monkeypatch.setattr(db_module, "utc_now", clock.now)
+    monkeypatch.setattr(limiter_module, "utc_now", clock.now)
+    monkeypatch.setattr(broker_module.time, "sleep", clock.oversleep)
+    store.set_rate_state(store.get_rate_state().model_copy(update={"last_request_at": started}))
+    fetcher = FakeOaiFetcher([], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            runtime_budget_seconds=4,
+            max_pages=1,
+            max_requests=1,
+        )
+    )
+
+    assert result.deadline_at == started + timedelta(seconds=4)
+    assert result.status == "budget_exceeded"
+    assert result.error_category == "runtime_budget_exceeded"
+    assert fetcher.seen == []
+
+
+def test_oai_accounting_db_wait_cannot_expire_scope_and_upstream_leases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    clock = _OaiAuditClock(started)
+    tuned = HuldraSettings(
+        db_path=tmp_path / "oai-accounting-db-wait.db",
+        request_interval_seconds=3.0,
+        cooldown_seconds=60,
+        rate_limit_jitter_seconds=0.0,
+        worker_poll_interval_seconds=1.0,
+        request_timeout_seconds=0.2,
+        lease_timeout_seconds=3,
+    )
+    monkeypatch.setattr(broker_module, "utc_now", clock.now)
+    monkeypatch.setattr(db_module, "utc_now", clock.now)
+    monkeypatch.setattr(limiter_module, "utc_now", clock.now)
+
+    seed = HuldraStore(tuned.db_path)
+    seed.init_schema()
+    first_store = HuldraStore(tuned.db_path, timeout=5)
+    second_store = HuldraStore(tuned.db_path, timeout=5)
+    fetcher = _TimedEmptyOaiFetcher(clock, [])
+    request = OaiHarvestRequest(
+        client_id="test",
+        mode=OaiHarvestMode.INITIAL,
+        runtime_budget_seconds=30,
+        max_pages=1,
+        max_requests=2,
+    )
+
+    accounting_stage = Event()
+    blocker_ready = Event()
+    lock_attempted = Event()
+    accounting_committed = Event()
+    allow_first_to_continue = Event()
+    accounting_active = Event()
+    errors: list[BaseException] = []
+    first_results: list[object] = []
+    original_begin = first_store.begin_immediate
+    original_account = first_store.record_oai_request_started
+
+    @contextmanager
+    def signal_accounting_lock_attempt() -> Iterator[sqlite3.Connection]:
+        if accounting_active.is_set():
+            lock_attempted.set()
+        with original_begin() as conn:
+            yield conn
+
+    def blocked_account(harvest_id: str) -> int:
+        accounting_stage.set()
+        assert blocker_ready.wait(timeout=5)
+        accounting_active.set()
+        try:
+            count = original_account(harvest_id)
+        finally:
+            accounting_active.clear()
+        accounting_committed.set()
+        assert allow_first_to_continue.wait(timeout=5)
+        return count
+
+    monkeypatch.setattr(first_store, "begin_immediate", signal_accounting_lock_attempt)
+    monkeypatch.setattr(first_store, "record_oai_request_started", blocked_account)
+
+    first_broker = HuldraBroker(first_store, tuned, oai_fetcher=fetcher)
+    second_broker = HuldraBroker(second_store, tuned, oai_fetcher=fetcher)
+
+    def run_first() -> None:
+        try:
+            first_results.append(first_broker.harvest_oai(request))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = Thread(target=run_first, daemon=True)
+    first_thread.start()
+    assert accounting_stage.wait(timeout=2)
+
+    blocker = sqlite3.connect(tuned.db_path, timeout=5)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker_ready.set()
+    assert lock_attempted.wait(timeout=2)
+    # Request accounting waits past both the scope and upstream lease deadlines.
+    clock.current += timedelta(seconds=15)
+    blocker.commit()
+    blocker.close()
+    assert accounting_committed.wait(timeout=2)
+
+    second_result = second_broker.harvest_oai(request)
+    allow_first_to_continue.set()
+    first_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert second_result.status in {"completed", "blocked", "budget_exceeded"}
+    assert len(fetcher.calls_at) <= 1
+    assert not errors
+
+
+def test_oai_scope_lease_covers_sqlite_wait_and_post_fetch_persistence(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tuned = settings.model_copy(update={"lease_timeout_seconds": 1})
+    observed_scope_timeouts: list[int] = []
+    acquire = store.acquire_lease
+
+    def capture_scope_timeout(
+        name: str,
+        owner_token: str,
+        timeout_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if name != "upstream_fetch":
+            observed_scope_timeouts.append(timeout_seconds)
+        return acquire(name, owner_token, timeout_seconds, now=now)
+
+    monkeypatch.setattr(store, "acquire_lease", capture_scope_timeout)
+    page = OaiPmhPage(
+        records=[],
+        response_date="2026-07-22T00:00:00Z",
+        resumption_token=None,
+        errors=[],
+        request_params={},
+    )
+
+    result = HuldraBroker(
+        store,
+        tuned,
+        oai_fetcher=FakeOaiFetcher([page], []),
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            mode=OaiHarvestMode.INITIAL,
+            max_pages=1,
+            max_requests=1,
+        )
+    )
+
+    assert result.status == "completed"
+    assert observed_scope_timeouts == [44]
+
+
+def test_oai_rechecks_deadline_after_request_accounting_before_network(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    clock = _OaiAuditClock(started)
+    monkeypatch.setattr(broker_module, "utc_now", clock.now)
+    monkeypatch.setattr(db_module, "utc_now", clock.now)
+    monkeypatch.setattr(limiter_module, "utc_now", clock.now)
+    original_started = store.record_oai_request_started
+
+    def account_then_expire(harvest_id: str) -> int:
+        requests_total = original_started(harvest_id)
+        clock.current += timedelta(seconds=5)
+        return requests_total
+
+    monkeypatch.setattr(store, "record_oai_request_started", account_then_expire)
+    fetcher = FakeOaiFetcher([], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            runtime_budget_seconds=4,
+            max_pages=1,
+            max_requests=1,
+        )
+    )
+
+    assert result.status == "budget_exceeded"
+    assert result.error_category == "runtime_budget_exceeded"
+    assert result.requests_total == 1
+    assert fetcher.seen == []
+
+
+def test_oai_uses_persisted_deadline_as_runtime_source_of_truth(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted_now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    execution_now = persisted_now + timedelta(seconds=5)
+    monkeypatch.setattr(db_module, "utc_now", lambda: persisted_now)
+    monkeypatch.setattr(broker_module, "utc_now", lambda: execution_now)
+    monkeypatch.setattr(limiter_module, "utc_now", lambda: execution_now)
+    fetcher = FakeOaiFetcher([], [])
+
+    result = HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            runtime_budget_seconds=4,
+            max_pages=1,
+            max_requests=1,
+        )
+    )
+
+    assert result.deadline_at == persisted_now + timedelta(seconds=4)
+    assert result.status == "budget_exceeded"
+    assert fetcher.seen == []
+
+
+def test_oai_final_page_checkpoint_completes_after_crash_without_refetch(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("huldra.broker.time.sleep", lambda _: None)
+    final = parse_oai_pmh_list_records(OAI_DELETED_PAGE)
+    request = OaiHarvestRequest(
+        client_id="test",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+    )
+    broker = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=FakeOaiFetcher([final], []),
+    )
+    original = store.set_oai_watermark
+
+    def crash_after_checkpoint(**kwargs: Any) -> None:
+        store.set_oai_watermark = original  # type: ignore[method-assign]
+        raise RuntimeError("simulated finalization crash")
+
+    store.set_oai_watermark = crash_after_checkpoint  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated finalization crash"):
+        broker.harvest_oai(request)
+
+    resumed_fetcher = FakeOaiFetcher([], [])
+    result = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=resumed_fetcher,
+    ).harvest_oai(request)
+
+    assert result.status == "completed"
+    assert result.pages_total == 1
+    assert result.records_processed == 1
+    assert resumed_fetcher.seen == []
+
+
+def test_oai_same_scope_harvest_is_single_flight_across_brokers(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    entered = Event()
+    release = Event()
+    final = parse_oai_pmh_list_records(OAI_DELETED_PAGE)
+
+    class BlockingFetcher:
+        calls = 0
+
+        def list_records(self, **_kwargs: Any) -> OaiPmhPage:
+            self.calls += 1
+            entered.set()
+            assert release.wait(timeout=2)
+            return final
+
+    fetcher = BlockingFetcher()
+    request = OaiHarvestRequest(
+        client_id="test",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INITIAL,
+    )
+    first_results: list[object] = []
+
+    def run_first() -> None:
+        try:
+            first_results.append(
+                HuldraBroker(store=store, settings=settings, oai_fetcher=fetcher).harvest_oai(
+                    request
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised below
+            first_results.append(exc)
+
+    thread = Thread(target=run_first)
+    thread.start()
+    assert entered.wait(timeout=2)
+
+    blocked_fetcher = FakeOaiFetcher([], [])
+    blocked = HuldraBroker(
+        store=store,
+        settings=settings,
+        oai_fetcher=blocked_fetcher,
+    ).harvest_oai(request)
+
+    assert blocked.status == "blocked"
+    assert blocked.error_category == "harvest_in_progress"
+    assert blocked_fetcher.seen == []
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(first_results) == 1
+    assert not isinstance(first_results[0], BaseException), first_results
+    assert fetcher.calls == 1
+
+
+def test_oai_initial_and_incremental_watermark_writers_share_scope(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(broker_module.time, "sleep", lambda _seconds: None)
+    entered = Event()
+    release = Event()
+    older = replace(
+        parse_oai_pmh_list_records(OAI_DELETED_PAGE),
+        response_date="2026-07-20T00:00:00Z",
+    )
+    newer = replace(
+        parse_oai_pmh_list_records(OAI_DELETED_PAGE),
+        response_date="2026-07-22T00:00:00Z",
+    )
+
+    class BlockingFetcher:
+        def list_records(self, **_kwargs: Any) -> OaiPmhPage:
+            entered.set()
+            assert release.wait(timeout=2)
+            return older
+
+    first_results: list[object] = []
+
+    def run_initial() -> None:
+        try:
+            first_results.append(
+                HuldraBroker(
+                    store=store,
+                    settings=settings,
+                    oai_fetcher=BlockingFetcher(),
+                ).harvest_oai(
+                    OaiHarvestRequest(
+                        client_id="initial",
+                        metadata_prefix="arXiv",
+                        mode=OaiHarvestMode.INITIAL,
+                    )
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised below
+            first_results.append(exc)
+
+    thread = Thread(target=run_initial)
+    thread.start()
+    assert entered.wait(timeout=2)
+    second_store = HuldraStore(settings.db_path)
+    blocked_fetcher = FakeOaiFetcher([], [])
+    incremental_request = OaiHarvestRequest(
+        client_id="incremental",
+        metadata_prefix="arXiv",
+        mode=OaiHarvestMode.INCREMENTAL,
+    )
+
+    blocked = HuldraBroker(
+        store=second_store,
+        settings=settings,
+        oai_fetcher=blocked_fetcher,
+    ).harvest_oai(incremental_request)
+
+    assert blocked.status == "blocked"
+    assert blocked.error_category == "harvest_in_progress"
+    assert blocked_fetcher.seen == []
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(first_results) == 1
+    assert not isinstance(first_results[0], BaseException), first_results
+
+    completed = HuldraBroker(
+        store=second_store,
+        settings=settings,
+        oai_fetcher=FakeOaiFetcher([newer], []),
+    ).harvest_oai(incremental_request)
+
+    assert completed.status == "completed"
+    watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
+    assert watermark is not None
+    assert watermark["last_response_date"] == "2026-07-22"
+
+
+def test_oai_watermark_updates_never_regress(
+    store: HuldraStore,
+) -> None:
+    store.set_oai_watermark(
+        metadata_prefix="arXiv",
+        set_spec=None,
+        last_response_date="2026-07-22",
+        last_datestamp_seen="2026-07-21",
+        harvest_id="newer",
+    )
+    store.set_oai_watermark(
+        metadata_prefix="arXiv",
+        set_spec=None,
+        last_response_date="2026-07-20",
+        last_datestamp_seen="2026-07-19",
+        harvest_id="older",
+    )
+
+    watermark = store.get_oai_watermark(metadata_prefix="arXiv", set_spec=None)
+    assert watermark is not None
+    assert watermark["last_response_date"] == "2026-07-22"
+    assert watermark["last_datestamp_seen"] == "2026-07-21"
 
 
 def test_oai_harvest_request_resumption_token_starts_with_token(

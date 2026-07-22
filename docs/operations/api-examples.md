@@ -86,6 +86,8 @@ curl -X POST http://127.0.0.1:8765/v1/sync \
     "wait": true,
     "wait_timeout_seconds": 30,
     "mode": "slice",
+    "max_pages_per_window": 100,
+    "max_requests_total": 500,
     "requests": [
       {
         "client_id": "recoleta:example",
@@ -115,6 +117,8 @@ curl -X POST http://127.0.0.1:8765/v1/backfill \
     "end_date": "2026-05-07",
     "max_results": 60,
     "wait": false,
+    "max_pages_per_window": 100,
+    "max_requests_total": 500,
     "client_id": "huldra-backfill"
   }'
 ```
@@ -122,8 +126,9 @@ curl -X POST http://127.0.0.1:8765/v1/backfill \
 The maintenance response reports counters for this call, including
 `requested_total`, `queued_total`, `cache_hit_total`, `cache_miss_total`,
 `completed_windows_total`, `completed_slices_total`, `upstream_requests_total`,
-`upstream_429_total`, and per-window `raw_cache_status`, `serving_status`,
-`coverage_status`, `pages_total`, and `pages_completed_total`.
+`upstream_429_total`, `budget_exhausted_windows_total`, and per-window
+`raw_cache_status`, `serving_status`, `coverage_status`, `pages_total`, and
+`pages_completed_total`.
 
 ## Harvest OAI-PMH
 
@@ -134,14 +139,18 @@ curl -X POST http://127.0.0.1:8765/v1/harvest/oai \
     "client_id": "mirror:cs-ai",
     "metadata_prefix": "arXiv",
     "set_spec": "cs:cs:AI",
-    "mode": "incremental"
+    "mode": "incremental",
+    "max_pages": 1000,
+    "max_requests": 1000,
+    "runtime_budget_seconds": 3600
   }'
 ```
 
 OAI harvest responses include `records_processed`, `papers_upserted`,
-`deleted_records`, `pages_total`, `current_watermark`, and `resumption_token`.
-If a harvest stops during cooldown after a token was received, repeat the same
-request to continue from the saved token. To resume from a specific token, add
+`deleted_records`, `pages_total`, `requests_total`, `deadline_at`,
+`current_watermark`, and `resumption_token`. Page progress and the next token
+are committed atomically. If a process stops, repeat the same request to resume
+without refetching committed pages. To begin from a specific token, add
 `"resumption_token": "..."` to the request body.
 
 ## Read A Paper
@@ -152,9 +161,10 @@ curl http://127.0.0.1:8765/v1/papers/2401.00001v1
 
 ## Cooldown Behavior
 
-When arXiv returns HTTP 429, Huldra stores `cooldown_until`. During cooldown,
-new requests may enter the queue, but workers return a cooling-down state and
-do not send another upstream request.
+When arXiv returns HTTP 429, or OAI returns `503 + Retry-After`, Huldra stores an
+adaptive `cooldown_until`. During cooldown, new requests may enter the queue,
+but workers return a cooling-down state and do not send another upstream
+request. `Retry-After` is never shortened.
 
 ## Security
 

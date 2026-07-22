@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from huldra.config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from huldra.keys import arxiv_id_family_base, arxiv_version, normalize_arxiv_id, request_cache_key
 from huldra.migrations import apply_migrations
 from huldra.models import (
@@ -46,7 +47,15 @@ _ASYNC_SYNC_JOB_HANDOFF_PLACEHOLDERS = ",".join(
     "?" for _ in _ASYNC_SYNC_JOB_HANDOFF_STATUSES
 )
 _RETENTION_TABLES = frozenset(
-    {"cache_entries", "events", "queue_items", "sync_jobs", "sync_job_pages"}
+    {
+        "cache_entries",
+        "events",
+        "queue_items",
+        "queue_item_upstream_budgets",
+        "sync_jobs",
+        "sync_job_pages",
+        "upstream_request_budgets",
+    }
 )
 # Async maintenance sets completed_at when handing work to a worker. Reclaim
 # that job only after all work records for every page are old and terminal.
@@ -293,9 +302,14 @@ class HuldraStore:
         requested_at: datetime | None = None,
         completed_at: datetime | None = None,
     ) -> None:
-        requested = isoformat_or_none(requested_at or utc_now())
-        completed = isoformat_or_none(completed_at or utc_now())
-        assert requested is not None and completed is not None
+        requested_value = ensure_utc(requested_at or utc_now())
+        completed_value = ensure_utc(completed_at or utc_now())
+        requested = isoformat_or_none(requested_value)
+        completed = isoformat_or_none(completed_value)
+        refresh_after = isoformat_or_none(
+            completed_value + timedelta(seconds=request.refresh_interval_seconds)
+        )
+        assert requested is not None and completed is not None and refresh_after is not None
         with self.begin_immediate() as conn:
             matched_arxiv_ids = list(
                 dict.fromkeys(self._upsert_paper_conn(conn, paper, completed) for paper in papers)
@@ -313,17 +327,18 @@ class HuldraStore:
                 """
                 INSERT INTO cache_entries (
                     cache_key, request_json, api_family, status, requested_at,
-                    completed_at, cooldown_until, upstream_status,
+                    completed_at, refresh_after, cooldown_until, upstream_status,
                     upstream_requests_total, result_count, total_results,
                     coverage_status, error_category, error_message
                 )
-                VALUES (?, ?, ?, 'completed', ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL)
+                VALUES (?, ?, ?, 'completed', ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     request_json=excluded.request_json,
                     api_family=excluded.api_family,
                     status='completed',
                     requested_at=excluded.requested_at,
                     completed_at=excluded.completed_at,
+                    refresh_after=excluded.refresh_after,
                     cooldown_until=NULL,
                     upstream_status=excluded.upstream_status,
                     upstream_requests_total=excluded.upstream_requests_total,
@@ -339,6 +354,7 @@ class HuldraStore:
                     request.api_family,
                     requested,
                     completed,
+                    refresh_after,
                     upstream_status,
                     upstream_total,
                     len(matched_arxiv_ids),
@@ -446,6 +462,8 @@ class HuldraStore:
                 row = rows_by_id.get(arxiv_id)
                 if row is None:
                     row = _oai_base_paper_row_for_versioned_read(conn, arxiv_id)
+                if row is None:
+                    row = _latest_versioned_paper_row_for_base_read(conn, arxiv_id)
                 if row is not None:
                     papers_by_requested_id[arxiv_id] = _paper_from_row(row)
         return papers_by_requested_id
@@ -455,6 +473,8 @@ class HuldraStore:
             row = conn.execute("SELECT * FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()
             if row is None:
                 row = _oai_base_paper_row_for_versioned_read(conn, arxiv_id)
+            if row is None:
+                row = _latest_versioned_paper_row_for_base_read(conn, arxiv_id)
         return _paper_from_row(row) if row else None
 
     def mark_paper_deleted(
@@ -488,7 +508,401 @@ class HuldraStore:
                 ),
             )
 
-    def create_sync_job(self, request: ArxivRequest, mode: LegacySyncMode) -> str:
+    def create_upstream_request_budget(
+        self,
+        *,
+        max_requests: int,
+        deadline_at: datetime | None,
+    ) -> str:
+        if max_requests <= 0:
+            raise ValueError("max_requests must be positive")
+        budget_id = str(uuid4())
+        timestamp = isoformat_or_none(utc_now())
+        deadline = isoformat_or_none(ensure_utc(deadline_at)) if deadline_at is not None else None
+        assert timestamp is not None
+        with self.begin_immediate() as conn:
+            conn.execute(
+                """
+                INSERT INTO upstream_request_budgets(
+                    budget_id, max_requests, requests_started,
+                    deadline_at, created_at, updated_at
+                )
+                VALUES (?, ?, 0, ?, ?, ?)
+                """,
+                (budget_id, max_requests, deadline, timestamp, timestamp),
+            )
+            self._record_event_conn(
+                conn,
+                "upstream_budget_created",
+                {
+                    "budget_id": budget_id,
+                    "max_requests": max_requests,
+                    "deadline_at": deadline,
+                },
+            )
+        return budget_id
+
+    def get_upstream_request_budget_requests_started(self, budget_id: str) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT requests_started FROM upstream_request_budgets WHERE budget_id=?",
+                (budget_id,),
+            ).fetchone()
+        return int(row["requests_started"]) if row is not None else None
+
+    def reserve_upstream_request(
+        self,
+        budget_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Atomically consume one upstream attempt or return a terminal budget error."""
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            return self._reserve_upstream_budgets_conn(
+                conn,
+                (budget_id,),
+                current=current,
+            )
+
+    def reserve_queue_item_upstream_request(
+        self,
+        request_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Charge every viable joined budget without cancelling other demand."""
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            state = _queue_item_upstream_budget_attempt_state_conn(conn, request_id)
+            all_budget_ids = (*state.active_budget_ids, *state.future_budget_ids)
+            invalid_budgets = _upstream_budget_errors_conn(
+                conn,
+                all_budget_ids,
+                current=current,
+                enforce_request_limit=False,
+            )
+            capacity_errors = _upstream_budget_errors_conn(
+                conn,
+                (*state.uncharged_budget_ids, *state.future_budget_ids),
+                current=current,
+                enforce_request_limit=True,
+            )
+            for budget_id, error_category in capacity_errors.items():
+                invalid_budgets.setdefault(budget_id, error_category)
+            if invalid_budgets:
+                self._detach_invalid_queue_budgets_conn(
+                    conn,
+                    request_id=request_id,
+                    invalid_budgets=invalid_budgets,
+                )
+            valid_active_budget_ids = tuple(
+                budget_id
+                for budget_id in state.active_budget_ids
+                if budget_id not in invalid_budgets
+            )
+            valid_future_budget_ids = tuple(
+                budget_id
+                for budget_id in state.future_budget_ids
+                if budget_id not in invalid_budgets
+            )
+            valid_uncharged_budget_ids = tuple(
+                budget_id
+                for budget_id in state.uncharged_budget_ids
+                if budget_id not in invalid_budgets
+            )
+            if not state.unbudgeted_demand and not valid_active_budget_ids:
+                if valid_future_budget_ids:
+                    return "budget_deferred"
+                return _preferred_upstream_budget_error(invalid_budgets)
+            budget_error = self._reserve_upstream_budgets_conn(
+                conn,
+                valid_uncharged_budget_ids,
+                current=current,
+            )
+            if budget_error is not None:
+                return budget_error
+            if valid_uncharged_budget_ids:
+                placeholders = ",".join("?" for _ in valid_uncharged_budget_ids)
+                conn.execute(
+                    f"""
+                    UPDATE queue_item_upstream_budgets
+                    SET last_charged_attempt=?
+                    WHERE request_id=?
+                      AND budget_id IN ({placeholders})
+                    """,
+                    (
+                        state.attempt_number,
+                        request_id,
+                        *valid_uncharged_budget_ids,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE queue_items
+                SET upstream_budget_gate_closed=1
+                WHERE request_id=? AND status='claimed'
+                """,
+                (request_id,),
+            )
+            return None
+
+    def _detach_invalid_queue_budgets_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        invalid_budgets: dict[str, str],
+    ) -> None:
+        for budget_id, error_category in invalid_budgets.items():
+            self._record_event_conn(
+                conn,
+                "upstream_budget_exhausted",
+                {
+                    "budget_id": budget_id,
+                    "request_id": request_id,
+                    "error_category": error_category,
+                },
+            )
+        _detach_queue_budget_memberships_conn(
+            conn,
+            request_id,
+            tuple(invalid_budgets),
+        )
+
+    def _reserve_upstream_budgets_conn(
+        self,
+        conn: sqlite3.Connection,
+        budget_ids: tuple[str, ...],
+        *,
+        current: datetime,
+    ) -> str | None:
+        if not budget_ids:
+            return None
+        current_s = isoformat_or_none(current)
+        assert current_s is not None
+        budgets: list[sqlite3.Row] = []
+        for budget_id in budget_ids:
+            budget = conn.execute(
+                "SELECT * FROM upstream_request_budgets WHERE budget_id=?",
+                (budget_id,),
+            ).fetchone()
+            error_category: str | None = None
+            if budget is None:
+                error_category = "request_budget_exceeded"
+            else:
+                deadline_at = from_isoformat_or_none(budget["deadline_at"])
+                if deadline_at is not None and current >= deadline_at:
+                    error_category = "deadline_budget_exceeded"
+                elif int(budget["requests_started"]) >= int(budget["max_requests"]):
+                    error_category = "request_budget_exceeded"
+            if error_category is not None:
+                self._record_event_conn(
+                    conn,
+                    "upstream_budget_exhausted",
+                    {
+                        "budget_id": budget_id,
+                        "error_category": error_category,
+                    },
+                )
+                return error_category
+            assert budget is not None
+            budgets.append(budget)
+        conn.executemany(
+            """
+            UPDATE upstream_request_budgets
+            SET requests_started=requests_started + 1,
+                updated_at=?
+            WHERE budget_id=?
+            """,
+            ((current_s, str(budget["budget_id"])) for budget in budgets),
+        )
+        return None
+
+    def check_upstream_request_deadline(
+        self,
+        budget_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Recheck the durable wall deadline immediately before network I/O."""
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            return _check_upstream_budget_deadlines_conn(
+                conn,
+                (budget_id,),
+                current=current,
+            )
+
+    def check_queue_item_upstream_request_deadlines(
+        self,
+        request_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Recheck viable joined budgets after database waits and before I/O."""
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            state = _queue_item_upstream_budget_attempt_state_conn(conn, request_id)
+            invalid_budgets = _upstream_budget_errors_conn(
+                conn,
+                (*state.active_budget_ids, *state.future_budget_ids),
+                current=current,
+                enforce_request_limit=False,
+            )
+            if invalid_budgets:
+                self._detach_invalid_queue_budgets_conn(
+                    conn,
+                    request_id=request_id,
+                    invalid_budgets=invalid_budgets,
+                )
+            valid_active_budget_ids = tuple(
+                budget_id
+                for budget_id in state.active_budget_ids
+                if budget_id not in invalid_budgets
+            )
+            if state.unbudgeted_demand or valid_active_budget_ids:
+                return None
+            valid_future_budget_ids = tuple(
+                budget_id
+                for budget_id in state.future_budget_ids
+                if budget_id not in invalid_budgets
+            )
+            if valid_future_budget_ids:
+                return "budget_deferred"
+            return _preferred_upstream_budget_error(invalid_budgets)
+
+    def queue_item_upstream_budget_ids(self, request_id: str) -> tuple[str, ...]:
+        with self.connect() as conn:
+            return _queue_item_upstream_budget_ids_conn(conn, request_id)
+
+    def queue_item_upstream_deadline(self, request_id: str) -> datetime | None:
+        """Return the least restrictive deadline among current-attempt consumers."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT item.unbudgeted_demand,
+                       membership.budget_id,
+                       budget.deadline_at
+                FROM queue_items AS item
+                LEFT JOIN queue_item_upstream_budgets AS membership
+                  ON membership.request_id=item.request_id
+                 AND membership.first_attempt_number <= item.attempts_total
+                LEFT JOIN upstream_request_budgets AS budget
+                  ON budget.budget_id=membership.budget_id
+                WHERE item.request_id=?
+                """,
+                (request_id,),
+            ).fetchall()
+        if not rows or bool(rows[0]["unbudgeted_demand"]):
+            return None
+        deadlines: list[datetime] = []
+        for row in rows:
+            if row["budget_id"] is None:
+                continue
+            deadline = from_isoformat_or_none(row["deadline_at"])
+            if deadline is None:
+                return None
+            deadlines.append(deadline)
+        return max(deadlines, default=None)
+
+    def fail_active_upstream_budget_items(
+        self,
+        budget_id: str,
+        *,
+        error_category: str,
+        error_message: str,
+        now: datetime | None = None,
+    ) -> int:
+        timestamp = isoformat_or_none(now or utc_now())
+        assert timestamp is not None
+        with self.begin_immediate() as conn:
+            affected = conn.execute(
+                """
+                SELECT request_id
+                FROM queue_items
+                WHERE (
+                    upstream_budget_id=?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM queue_item_upstream_budgets AS membership
+                        WHERE membership.request_id=queue_items.request_id
+                          AND membership.budget_id=?
+                    )
+                )
+                  AND status IN ('queued', 'delayed', 'claimed')
+                """,
+                (budget_id, budget_id),
+            ).fetchall()
+            failed_total = 0
+            for row in affected:
+                request_id = str(row["request_id"])
+                _detach_queue_budget_memberships_conn(
+                    conn,
+                    request_id,
+                    (budget_id,),
+                )
+                demand = conn.execute(
+                    """
+                    SELECT unbudgeted_demand,
+                           EXISTS(
+                               SELECT 1
+                               FROM queue_item_upstream_budgets AS membership
+                               WHERE membership.request_id=queue_items.request_id
+                           ) AS has_budgeted_demand
+                    FROM queue_items
+                    WHERE request_id=?
+                    """,
+                    (request_id,),
+                ).fetchone()
+                if demand is None or bool(demand["unbudgeted_demand"]):
+                    continue
+                if bool(demand["has_budgeted_demand"]):
+                    continue
+                updated = conn.execute(
+                    """
+                    UPDATE queue_items
+                    SET status='failed',
+                        updated_at=?,
+                        claimed_by=NULL,
+                        claimed_until=NULL,
+                        upstream_budget_gate_closed=0,
+                        next_attempt_at=NULL,
+                        error_category=?,
+                        error_message=?
+                    WHERE request_id=?
+                      AND status IN ('queued', 'delayed', 'claimed')
+                    """,
+                    (
+                        timestamp,
+                        error_category,
+                        error_message[:1000],
+                        request_id,
+                    ),
+                )
+                failed_total += updated.rowcount
+            if affected:
+                self._record_event_conn(
+                    conn,
+                    "upstream_budget_queue_reconciled",
+                    {
+                        "budget_id": budget_id,
+                        "items_total": len(affected),
+                        "detached_total": len(affected),
+                        "failed_total": failed_total,
+                        "preserved_total": len(affected) - failed_total,
+                        "error_category": error_category,
+                    },
+                )
+        return failed_total
+
+    def create_sync_job(
+        self,
+        request: ArxivRequest,
+        mode: LegacySyncMode,
+        *,
+        upstream_budget_id: str | None = None,
+    ) -> str:
         sync_job_id = str(uuid4())
         timestamp = isoformat_or_none(utc_now())
         assert timestamp is not None
@@ -496,11 +910,19 @@ class HuldraStore:
             conn.execute(
                 """
                 INSERT INTO sync_jobs(
-                    sync_job_id, mode, request_json, status, created_at, updated_at
+                    sync_job_id, mode, request_json, status, upstream_budget_id,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, 'running', ?, ?)
+                VALUES (?, ?, ?, 'running', ?, ?, ?)
                 """,
-                (sync_job_id, mode, _request_json(request), timestamp, timestamp),
+                (
+                    sync_job_id,
+                    mode,
+                    _request_json(request),
+                    upstream_budget_id,
+                    timestamp,
+                    timestamp,
+                ),
             )
             self._record_event_conn(
                 conn,
@@ -558,6 +980,21 @@ class HuldraStore:
                     timestamp,
                     timestamp,
                 ),
+            )
+
+    def delete_sync_job_followup_pages(
+        self,
+        *,
+        sync_job_id: str,
+        initial_cache_key: str,
+    ) -> None:
+        with self.begin_immediate() as conn:
+            conn.execute(
+                """
+                DELETE FROM sync_job_pages
+                WHERE sync_job_id=? AND cache_key<>?
+                """,
+                (sync_job_id, initial_cache_key),
             )
 
     def refresh_sync_job_page_from_cache(
@@ -678,18 +1115,27 @@ class HuldraStore:
             "error_message": row["error_message"],
         }
 
-    def create_oai_harvest_job(self, request: OaiHarvestRequest) -> str:
+    def create_oai_harvest_job(
+        self,
+        request: OaiHarvestRequest,
+        *,
+        resumption_token: str | None = None,
+    ) -> str:
         harvest_id = str(uuid4())
-        timestamp = isoformat_or_none(utc_now())
-        assert timestamp is not None
+        started = utc_now()
+        timestamp = isoformat_or_none(started)
+        deadline = isoformat_or_none(
+            started + timedelta(seconds=request.runtime_budget_seconds)
+        )
+        assert timestamp is not None and deadline is not None
         with self.begin_immediate() as conn:
             conn.execute(
                 """
                 INSERT INTO oai_harvest_jobs(
                     harvest_id, request_json, status, metadata_prefix, set_spec,
-                    mode, started_at
+                    mode, resumption_token, deadline_at, started_at, updated_at
                 )
-                VALUES (?, ?, 'running', ?, ?, ?, ?)
+                VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     harvest_id,
@@ -697,6 +1143,9 @@ class HuldraStore:
                     request.metadata_prefix,
                     request.set_spec,
                     request.mode,
+                    resumption_token,
+                    deadline,
+                    timestamp,
                     timestamp,
                 ),
             )
@@ -712,6 +1161,85 @@ class HuldraStore:
             )
         return harvest_id
 
+    def get_running_oai_harvest(self, request: OaiHarvestRequest) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM oai_harvest_jobs
+                WHERE status = 'running'
+                  AND metadata_prefix = ?
+                  AND COALESCE(set_spec, '') = ?
+                ORDER BY COALESCE(updated_at, started_at) DESC
+                LIMIT 50
+                """,
+                (request.metadata_prefix, _oai_set_key(request.set_spec)),
+            ).fetchall()
+        for row in rows:
+            try:
+                previous = _oai_request_from_json(row["request_json"])
+            except ValueError:
+                continue
+            if not _same_oai_resume_scope(previous, request):
+                continue
+            if (
+                request.resumption_token is not None
+                and row["resumption_token"] != request.resumption_token
+            ):
+                continue
+            return _oai_harvest_state_from_row(row)
+        return None
+
+    def record_oai_request_started(self, harvest_id: str) -> int:
+        timestamp = isoformat_or_none(utc_now())
+        assert timestamp is not None
+        with self.begin_immediate() as conn:
+            conn.execute(
+                """
+                UPDATE oai_harvest_jobs
+                SET requests_total=requests_total + 1,
+                    updated_at=?
+                WHERE harvest_id=? AND status='running'
+                """,
+                (timestamp, harvest_id),
+            )
+            row = conn.execute(
+                "SELECT requests_total FROM oai_harvest_jobs WHERE harvest_id=?",
+                (harvest_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown OAI harvest: {harvest_id}")
+        return int(row["requests_total"])
+
+    def ensure_oai_harvest_deadline(
+        self,
+        harvest_id: str,
+        deadline_at: datetime,
+    ) -> datetime:
+        deadline = isoformat_or_none(deadline_at)
+        timestamp = isoformat_or_none(utc_now())
+        assert deadline is not None and timestamp is not None
+        with self.begin_immediate() as conn:
+            conn.execute(
+                """
+                UPDATE oai_harvest_jobs
+                SET deadline_at=COALESCE(deadline_at, ?),
+                    updated_at=?
+                WHERE harvest_id=? AND status='running'
+                """,
+                (deadline, timestamp, harvest_id),
+            )
+            row = conn.execute(
+                "SELECT deadline_at FROM oai_harvest_jobs WHERE harvest_id=?",
+                (harvest_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown OAI harvest: {harvest_id}")
+        persisted = from_isoformat_or_none(row["deadline_at"])
+        if persisted is None:
+            raise ValueError(f"OAI harvest is not running: {harvest_id}")
+        return persisted
+
     def record_oai_page(
         self,
         *,
@@ -722,6 +1250,7 @@ class HuldraStore:
         response_date: str | None = None,
         records_count: int = 0,
         resumption_token_hash: str | None = None,
+        next_resumption_token_hash: str | None = None,
         error_category: str | None = None,
         error_message: str | None = None,
     ) -> None:
@@ -733,15 +1262,16 @@ class HuldraStore:
                 INSERT INTO oai_pages(
                     harvest_id, page_index, request_params_json,
                     resumption_token_hash, status, response_date, records_count,
-                    error_category, error_message, created_at
+                    next_resumption_token_hash, error_category, error_message, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(harvest_id, page_index) DO UPDATE SET
                     request_params_json=excluded.request_params_json,
                     resumption_token_hash=excluded.resumption_token_hash,
                     status=excluded.status,
                     response_date=excluded.response_date,
                     records_count=excluded.records_count,
+                    next_resumption_token_hash=excluded.next_resumption_token_hash,
                     error_category=excluded.error_category,
                     error_message=excluded.error_message
                 """,
@@ -753,11 +1283,133 @@ class HuldraStore:
                     status,
                     response_date,
                     records_count,
+                    next_resumption_token_hash,
                     error_category,
                     error_message[:1000] if error_message else None,
                     timestamp,
                 ),
             )
+
+    def checkpoint_oai_page(
+        self,
+        *,
+        harvest_id: str,
+        page_index: int,
+        request_params: dict[str, str],
+        records: list[OaiRecord],
+        response_date: str | None,
+        consumed_resumption_token: str | None,
+        consumed_resumption_token_hash: str | None,
+        next_resumption_token: str | None,
+        next_resumption_token_hash: str | None,
+        last_response_date: str | None,
+        last_datestamp_seen: str | None,
+        terminal_error_category: str | None = None,
+        terminal_error_message: str | None = None,
+    ) -> tuple[int, int, int]:
+        """Commit records, page audit data, and the next cursor as one checkpoint."""
+        timestamp = isoformat_or_none(utc_now())
+        assert timestamp is not None
+        with self.begin_immediate() as conn:
+            job = conn.execute(
+                """
+                SELECT status, pages_total, resumption_token
+                FROM oai_harvest_jobs
+                WHERE harvest_id=?
+                """,
+                (harvest_id,),
+            ).fetchone()
+            if (
+                job is None
+                or job["status"] != "running"
+                or int(job["pages_total"]) != page_index
+                or job["resumption_token"] != consumed_resumption_token
+            ):
+                raise RuntimeError("OAI page checkpoint no longer matches the durable cursor")
+            processed, upserted, deleted = self._upsert_oai_records_conn(
+                conn,
+                records,
+                timestamp,
+            )
+            conn.execute(
+                """
+                INSERT INTO oai_pages(
+                    harvest_id, page_index, request_params_json,
+                    resumption_token_hash, status, response_date, records_count,
+                    next_resumption_token_hash, error_category, error_message, created_at
+                )
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, NULL, NULL, ?)
+                ON CONFLICT(harvest_id, page_index) DO UPDATE SET
+                    request_params_json=excluded.request_params_json,
+                    resumption_token_hash=excluded.resumption_token_hash,
+                    status='completed',
+                    response_date=excluded.response_date,
+                    records_count=excluded.records_count,
+                    next_resumption_token_hash=excluded.next_resumption_token_hash,
+                    error_category=NULL,
+                    error_message=NULL
+                """,
+                (
+                    harvest_id,
+                    page_index,
+                    json.dumps(request_params, sort_keys=True, separators=(",", ":")),
+                    consumed_resumption_token_hash,
+                    response_date,
+                    len(records),
+                    next_resumption_token_hash,
+                    timestamp,
+                ),
+            )
+            updated = conn.execute(
+                """
+                UPDATE oai_harvest_jobs
+                SET records_processed=records_processed + ?,
+                    papers_upserted=papers_upserted + ?,
+                    deleted_records=deleted_records + ?,
+                    pages_total=MAX(pages_total, ?),
+                    resumption_token=?,
+                    last_response_date=COALESCE(?, last_response_date),
+                    last_datestamp_seen=COALESCE(?, last_datestamp_seen),
+                    finished_paging=?,
+                    error_category=?,
+                    error_message=?,
+                    updated_at=?
+                WHERE harvest_id=? AND status='running'
+                """,
+                (
+                    processed,
+                    upserted,
+                    deleted,
+                    page_index + 1,
+                    next_resumption_token,
+                    last_response_date,
+                    last_datestamp_seen,
+                    int(next_resumption_token is None),
+                    terminal_error_category,
+                    (
+                        terminal_error_message[:1000]
+                        if terminal_error_message is not None
+                        else None
+                    ),
+                    timestamp,
+                    harvest_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"OAI harvest is not running: {harvest_id}")
+        return processed, upserted, deleted
+
+    def get_oai_consumed_token_hashes(self, harvest_id: str) -> set[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT resumption_token_hash
+                FROM oai_pages
+                WHERE harvest_id=? AND resumption_token_hash IS NOT NULL
+                """,
+                (harvest_id,),
+            ).fetchall()
+        return {str(row["resumption_token_hash"]) for row in rows}
 
     def upsert_oai_records(
         self,
@@ -769,74 +1421,82 @@ class HuldraStore:
             return (0, 0, 0)
         timestamp = isoformat_or_none(now or utc_now())
         assert timestamp is not None
-        papers_upserted = 0
         with self.begin_immediate() as conn:
-            for record in records:
-                if record.paper is not None and not record.deleted:
-                    self._upsert_paper_conn(
-                        conn,
-                        _oai_paper_for_existing_version_family(conn, record.paper),
-                        timestamp,
-                    )
-                    papers_upserted += 1
-                existing = conn.execute(
-                    """
-                    SELECT first_seen_at FROM oai_records
-                    WHERE oai_identifier = ? AND metadata_prefix = ?
-                    """,
-                    (record.oai_identifier, record.metadata_prefix),
-                ).fetchone()
-                first_seen = existing["first_seen_at"] if existing else timestamp
+            return self._upsert_oai_records_conn(conn, records, timestamp)
+
+    def _upsert_oai_records_conn(
+        self,
+        conn: sqlite3.Connection,
+        records: list[OaiRecord],
+        timestamp: str,
+    ) -> tuple[int, int, int]:
+        papers_upserted = 0
+        for record in records:
+            if record.paper is not None and not record.deleted:
+                self._upsert_paper_conn(
+                    conn,
+                    _oai_paper_for_existing_version_family(conn, record.paper),
+                    timestamp,
+                )
+                papers_upserted += 1
+            existing = conn.execute(
+                """
+                SELECT first_seen_at FROM oai_records
+                WHERE oai_identifier = ? AND metadata_prefix = ?
+                """,
+                (record.oai_identifier, record.metadata_prefix),
+            ).fetchone()
+            first_seen = existing["first_seen_at"] if existing else timestamp
+            conn.execute(
+                """
+                INSERT INTO oai_records(
+                    oai_identifier, metadata_prefix, arxiv_id, datestamp,
+                    deleted, set_specs_json, raw_xml, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(oai_identifier, metadata_prefix) DO UPDATE SET
+                    arxiv_id=excluded.arxiv_id,
+                    datestamp=excluded.datestamp,
+                    deleted=excluded.deleted,
+                    set_specs_json=excluded.set_specs_json,
+                    raw_xml=excluded.raw_xml,
+                    last_seen_at=excluded.last_seen_at
+                """,
+                (
+                    record.oai_identifier,
+                    record.metadata_prefix,
+                    record.arxiv_id,
+                    isoformat_or_none(record.datestamp),
+                    int(record.deleted),
+                    json.dumps(record.set_specs, sort_keys=True, separators=(",", ":")),
+                    record.raw_xml,
+                    first_seen,
+                    timestamp,
+                ),
+            )
+            if record.deleted and record.arxiv_id:
+                arxiv_ids = _paper_arxiv_ids_in_version_family(conn, record.arxiv_id)
+                if not arxiv_ids:
+                    continue
+                placeholders = ",".join("?" for _ in arxiv_ids)
                 conn.execute(
-                    """
-                    INSERT INTO oai_records(
-                        oai_identifier, metadata_prefix, arxiv_id, datestamp,
-                        deleted, set_specs_json, raw_xml, first_seen_at, last_seen_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(oai_identifier, metadata_prefix) DO UPDATE SET
-                        arxiv_id=excluded.arxiv_id,
-                        datestamp=excluded.datestamp,
-                        deleted=excluded.deleted,
-                        set_specs_json=excluded.set_specs_json,
-                        raw_xml=excluded.raw_xml,
-                        last_seen_at=excluded.last_seen_at
+                    f"""
+                    UPDATE papers
+                    SET deleted=1,
+                        oai_identifier=?,
+                        oai_datestamp=COALESCE(?, oai_datestamp),
+                        oai_set_specs_json=?,
+                        last_seen_at=?
+                    WHERE arxiv_id IN ({placeholders})
                     """,
                     (
                         record.oai_identifier,
-                        record.metadata_prefix,
-                        record.arxiv_id,
                         isoformat_or_none(record.datestamp),
-                        int(record.deleted),
                         json.dumps(record.set_specs, sort_keys=True, separators=(",", ":")),
-                        record.raw_xml,
-                        first_seen,
                         timestamp,
+                        *arxiv_ids,
                     ),
                 )
-                if record.deleted and record.arxiv_id:
-                    arxiv_ids = _paper_arxiv_ids_in_version_family(conn, record.arxiv_id)
-                    if not arxiv_ids:
-                        continue
-                    placeholders = ",".join("?" for _ in arxiv_ids)
-                    conn.execute(
-                        f"""
-                        UPDATE papers
-                        SET deleted=1,
-                            oai_identifier=?,
-                            oai_datestamp=COALESCE(?, oai_datestamp),
-                            oai_set_specs_json=?,
-                            last_seen_at=?
-                        WHERE arxiv_id IN ({placeholders})
-                        """,
-                        (
-                            record.oai_identifier,
-                            isoformat_or_none(record.datestamp),
-                            json.dumps(record.set_specs, sort_keys=True, separators=(",", ":")),
-                            timestamp,
-                            *arxiv_ids,
-                        ),
-                    )
 
         return (len(records), papers_upserted, sum(1 for record in records if record.deleted))
 
@@ -846,6 +1506,7 @@ class HuldraStore:
             "cooling_down",
             "blocked",
             "transient_failure",
+            "budget_exceeded",
         )
         with self.connect() as conn:
             rows = conn.execute(
@@ -919,10 +1580,60 @@ class HuldraStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(metadata_prefix, set_spec) DO UPDATE SET
-                    last_response_date=excluded.last_response_date,
-                    last_datestamp_seen=excluded.last_datestamp_seen,
-                    last_successful_harvest_id=excluded.last_successful_harvest_id,
-                    updated_at=excluded.updated_at
+                    last_response_date=CASE
+                        WHEN excluded.last_response_date IS NULL
+                            THEN oai_watermarks.last_response_date
+                        WHEN oai_watermarks.last_response_date IS NULL
+                          OR date(excluded.last_response_date)
+                             >= date(oai_watermarks.last_response_date)
+                            THEN excluded.last_response_date
+                        ELSE oai_watermarks.last_response_date
+                    END,
+                    last_datestamp_seen=CASE
+                        WHEN excluded.last_datestamp_seen IS NULL
+                            THEN oai_watermarks.last_datestamp_seen
+                        WHEN oai_watermarks.last_datestamp_seen IS NULL
+                          OR date(excluded.last_datestamp_seen)
+                             >= date(oai_watermarks.last_datestamp_seen)
+                            THEN excluded.last_datestamp_seen
+                        ELSE oai_watermarks.last_datestamp_seen
+                    END,
+                    last_successful_harvest_id=CASE
+                        WHEN (
+                            excluded.last_response_date IS NOT NULL
+                            AND (
+                                oai_watermarks.last_response_date IS NULL
+                                OR date(excluded.last_response_date)
+                                   >= date(oai_watermarks.last_response_date)
+                            )
+                        ) OR (
+                            excluded.last_datestamp_seen IS NOT NULL
+                            AND (
+                                oai_watermarks.last_datestamp_seen IS NULL
+                                OR date(excluded.last_datestamp_seen)
+                                   >= date(oai_watermarks.last_datestamp_seen)
+                            )
+                        ) THEN excluded.last_successful_harvest_id
+                        ELSE oai_watermarks.last_successful_harvest_id
+                    END,
+                    updated_at=CASE
+                        WHEN (
+                            excluded.last_response_date IS NOT NULL
+                            AND (
+                                oai_watermarks.last_response_date IS NULL
+                                OR date(excluded.last_response_date)
+                                   >= date(oai_watermarks.last_response_date)
+                            )
+                        ) OR (
+                            excluded.last_datestamp_seen IS NOT NULL
+                            AND (
+                                oai_watermarks.last_datestamp_seen IS NULL
+                                OR date(excluded.last_datestamp_seen)
+                                   >= date(oai_watermarks.last_datestamp_seen)
+                            )
+                        ) THEN excluded.updated_at
+                        ELSE oai_watermarks.updated_at
+                    END
                 """,
                 (
                     metadata_prefix,
@@ -963,6 +1674,7 @@ class HuldraStore:
                     resumption_token=?,
                     error_category=?,
                     error_message=?,
+                    updated_at=?,
                     completed_at=?
                 WHERE harvest_id=?
                 """,
@@ -976,6 +1688,7 @@ class HuldraStore:
                     resumption_token,
                     error_category,
                     error_message[:1000] if error_message else None,
+                    completed,
                     completed,
                     harvest_id,
                 ),
@@ -1015,10 +1728,12 @@ class HuldraStore:
             papers_upserted=int(row["papers_upserted"]),
             deleted_records=int(row["deleted_records"]),
             pages_total=int(row["pages_total"]),
+            requests_total=int(row["requests_total"]),
             current_watermark=row["current_watermark"],
             resumption_token=row["resumption_token"],
             error_category=row["error_category"],
             error_message=row["error_message"],
+            deadline_at=from_isoformat_or_none(row["deadline_at"]),
         )
 
     def record_cache_failure(
@@ -1031,8 +1746,11 @@ class HuldraStore:
         status: str = "failed",
         cooldown_until: datetime | None = None,
         upstream_status: int | None = None,
+        upstream_request_count: int = 1,
         requested_at: datetime | None = None,
     ) -> None:
+        if upstream_request_count < 0:
+            raise ValueError("upstream_request_count cannot be negative")
         timestamp = isoformat_or_none(requested_at or utc_now())
         cooldown = isoformat_or_none(cooldown_until)
         assert timestamp is not None
@@ -1042,7 +1760,11 @@ class HuldraStore:
                 (cache_key,),
             ).fetchone()
             final_status = "completed" if previous and previous["status"] == "completed" else status
-            upstream_total = int(previous["upstream_requests_total"]) + 1 if previous else 1
+            upstream_total = (
+                int(previous["upstream_requests_total"]) + upstream_request_count
+                if previous
+                else upstream_request_count
+            )
             conn.execute(
                 """
                 INSERT INTO cache_entries (
@@ -1118,8 +1840,20 @@ class HuldraStore:
             cooldown_until=from_isoformat_or_none(row["cooldown_until"]),
             consecutive_429_total=int(row["consecutive_429_total"]),
             upstream_429_total=int(row["upstream_429_total"]),
+            consecutive_rate_limit_total=int(row["consecutive_rate_limit_total"]),
+            upstream_rate_limited_total=int(row["upstream_rate_limited_total"]),
+            upstream_oai_503_retry_after_total=int(
+                row["upstream_oai_503_retry_after_total"]
+            ),
             last_status=row["last_status"],
             last_error_message=row["last_error_message"],
+            last_request_started_at=from_isoformat_or_none(row["last_request_started_at"]),
+            last_rate_wait_seconds=row["last_rate_wait_seconds"],
+            last_request_latency_ms=row["last_request_latency_ms"],
+            last_retry_after_seconds=row["last_retry_after_seconds"],
+            last_effective_cooldown_seconds=row["last_effective_cooldown_seconds"],
+            last_rate_limit_kind=row["last_rate_limit_kind"],
+            last_api_family=row["last_api_family"],
         )
 
     def set_rate_state(self, state: RateState) -> None:
@@ -1128,16 +1862,31 @@ class HuldraStore:
                 """
                 INSERT INTO rate_state(
                     name, last_request_at, cooldown_until, consecutive_429_total,
-                    upstream_429_total, last_status, last_error_message
+                    upstream_429_total, consecutive_rate_limit_total,
+                    upstream_rate_limited_total, upstream_oai_503_retry_after_total,
+                    last_status, last_error_message, last_request_started_at,
+                    last_rate_wait_seconds, last_request_latency_ms,
+                    last_retry_after_seconds, last_effective_cooldown_seconds,
+                    last_rate_limit_kind, last_api_family
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     last_request_at=excluded.last_request_at,
                     cooldown_until=excluded.cooldown_until,
                     consecutive_429_total=excluded.consecutive_429_total,
                     upstream_429_total=excluded.upstream_429_total,
+                    consecutive_rate_limit_total=excluded.consecutive_rate_limit_total,
+                    upstream_rate_limited_total=excluded.upstream_rate_limited_total,
+                    upstream_oai_503_retry_after_total=excluded.upstream_oai_503_retry_after_total,
                     last_status=excluded.last_status,
-                    last_error_message=excluded.last_error_message
+                    last_error_message=excluded.last_error_message,
+                    last_request_started_at=excluded.last_request_started_at,
+                    last_rate_wait_seconds=excluded.last_rate_wait_seconds,
+                    last_request_latency_ms=excluded.last_request_latency_ms,
+                    last_retry_after_seconds=excluded.last_retry_after_seconds,
+                    last_effective_cooldown_seconds=excluded.last_effective_cooldown_seconds,
+                    last_rate_limit_kind=excluded.last_rate_limit_kind,
+                    last_api_family=excluded.last_api_family
                 """,
                 (
                     state.name,
@@ -1145,13 +1894,33 @@ class HuldraStore:
                     isoformat_or_none(state.cooldown_until),
                     state.consecutive_429_total,
                     state.upstream_429_total,
+                    state.consecutive_rate_limit_total,
+                    state.upstream_rate_limited_total,
+                    state.upstream_oai_503_retry_after_total,
                     state.last_status,
                     state.last_error_message,
+                    isoformat_or_none(state.last_request_started_at),
+                    state.last_rate_wait_seconds,
+                    state.last_request_latency_ms,
+                    state.last_retry_after_seconds,
+                    state.last_effective_cooldown_seconds,
+                    state.last_rate_limit_kind,
+                    state.last_api_family,
                 ),
             )
 
-    def enqueue_request(self, request: ArxivRequest, cache_key: str | None = None) -> QueueItem:
-        item, _joined = self.enqueue_request_for_work(request, cache_key)
+    def enqueue_request(
+        self,
+        request: ArxivRequest,
+        cache_key: str | None = None,
+        *,
+        default_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ) -> QueueItem:
+        item, _joined = self.enqueue_request_for_work(
+            request,
+            cache_key,
+            default_timeout_seconds=default_timeout_seconds,
+        )
         return item
 
     def enqueue_request_for_work(
@@ -1160,6 +1929,8 @@ class HuldraStore:
         cache_key: str | None = None,
         *,
         work_kind: QueueWorkKind | None = None,
+        upstream_budget_id: str | None = None,
+        default_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> tuple[QueueItem, bool]:
         key = cache_key or request_cache_key(request)
         resolved_work_kind = work_kind or (
@@ -1171,6 +1942,33 @@ class HuldraStore:
         now_s = isoformat_or_none(now)
         assert now_s is not None
         with self.begin_immediate() as conn:
+            return self._enqueue_request_for_work_conn(
+                conn,
+                request=request,
+                cache_key=key,
+                work_kind=resolved_work_kind,
+                upstream_budget_id=upstream_budget_id,
+                default_timeout_seconds=default_timeout_seconds,
+                now_s=now_s,
+            )
+
+    def enqueue_refresh_if_due(
+        self,
+        request: ArxivRequest,
+        cache_key: str | None = None,
+        *,
+        now: datetime | None = None,
+        default_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ) -> tuple[QueueItem | None, bool]:
+        """Atomically reserve a refresh period and enqueue at most one refresh."""
+        key = cache_key or request_cache_key(request)
+        current = ensure_utc(now or utc_now())
+        current_s = isoformat_or_none(current)
+        next_refresh = isoformat_or_none(
+            current + timedelta(seconds=request.refresh_interval_seconds)
+        )
+        assert current_s is not None and next_refresh is not None
+        with self.begin_immediate() as conn:
             existing = conn.execute(
                 """
                 SELECT * FROM queue_items
@@ -1181,59 +1979,221 @@ class HuldraStore:
                 (key,),
             ).fetchone()
             if existing is not None:
-                if (
-                    resolved_work_kind == QueueWorkKind.REFRESH_COMPLETED
-                    and existing["work_kind"] != QueueWorkKind.REFRESH_COMPLETED
-                ):
+                return self._enqueue_request_for_work_conn(
+                    conn,
+                    request=request,
+                    cache_key=key,
+                    work_kind=QueueWorkKind.REFRESH_COMPLETED,
+                    upstream_budget_id=None,
+                    default_timeout_seconds=default_timeout_seconds,
+                    now_s=current_s,
+                )
+            cache = conn.execute(
+                """
+                SELECT status, completed_at, refresh_after
+                FROM cache_entries
+                WHERE cache_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if cache is None or cache["status"] != "completed":
+                return None, False
+            refresh_after = from_isoformat_or_none(cache["refresh_after"])
+            completed_at = from_isoformat_or_none(cache["completed_at"])
+            requested_refresh_after = (
+                completed_at + timedelta(seconds=request.refresh_interval_seconds)
+                if completed_at is not None
+                else None
+            )
+            effective_refresh_after = refresh_after
+            if requested_refresh_after is not None and (
+                effective_refresh_after is None
+                or requested_refresh_after < effective_refresh_after
+            ):
+                effective_refresh_after = requested_refresh_after
+            if effective_refresh_after is not None and effective_refresh_after > current:
+                if effective_refresh_after != refresh_after:
                     conn.execute(
-                        """
-                        UPDATE queue_items
-                        SET work_kind=?, request_json=?, updated_at=?
-                        WHERE request_id=?
-                        """,
-                        (
-                            QueueWorkKind.REFRESH_COMPLETED,
-                            _request_json(request),
-                            now_s,
-                            existing["request_id"],
-                        ),
+                        "UPDATE cache_entries SET refresh_after = ? WHERE cache_key = ?",
+                        (isoformat_or_none(effective_refresh_after), key),
                     )
-                    existing = conn.execute(
-                        "SELECT * FROM queue_items WHERE request_id = ?",
-                        (existing["request_id"],),
-                    ).fetchone()
-                assert existing is not None
-                return _queue_item_from_row(existing), True
-            request_id = str(uuid4())
+                return None, False
+            conn.execute(
+                "UPDATE cache_entries SET refresh_after = ? WHERE cache_key = ?",
+                (next_refresh, key),
+            )
+            return self._enqueue_request_for_work_conn(
+                conn,
+                request=request,
+                cache_key=key,
+                work_kind=QueueWorkKind.REFRESH_COMPLETED,
+                upstream_budget_id=None,
+                default_timeout_seconds=default_timeout_seconds,
+                now_s=current_s,
+            )
+
+    def _enqueue_request_for_work_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request: ArxivRequest,
+        cache_key: str,
+        work_kind: QueueWorkKind,
+        upstream_budget_id: str | None,
+        default_timeout_seconds: float,
+        now_s: str,
+    ) -> tuple[QueueItem, bool]:
+        existing = conn.execute(
+            """
+            SELECT * FROM queue_items
+            WHERE cache_key = ? AND status IN ('queued', 'delayed', 'claimed')
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (cache_key,),
+        ).fetchone()
+        if existing is not None:
+            queue_item_changed = False
+            existing_request = _request_from_json(existing["request_json"])
+            replacement_request: ArxivRequest | None = None
+            replacement_work_kind = QueueWorkKind(existing["work_kind"])
+            if work_kind == QueueWorkKind.REFRESH_COMPLETED:
+                if replacement_work_kind != QueueWorkKind.REFRESH_COMPLETED:
+                    replacement_request = request
+                    replacement_work_kind = QueueWorkKind.REFRESH_COMPLETED
+                else:
+                    if (
+                        request.refresh_interval_seconds
+                        < existing_request.refresh_interval_seconds
+                    ):
+                        replacement_request = existing_request.model_copy(
+                            update={
+                                "refresh_interval_seconds": request.refresh_interval_seconds,
+                            }
+                        )
+            merged_request = replacement_request or existing_request
+            effective_timeout_seconds = max(
+                existing_request.timeout_seconds or default_timeout_seconds,
+                request.timeout_seconds or default_timeout_seconds,
+            )
+            effective_priority = max(existing_request.priority, request.priority)
+            request_updates: dict[str, object] = {}
+            if merged_request.timeout_seconds != effective_timeout_seconds:
+                request_updates["timeout_seconds"] = effective_timeout_seconds
+            if merged_request.priority != effective_priority:
+                request_updates["priority"] = effective_priority
+            if request_updates:
+                replacement_request = merged_request.model_copy(update=request_updates)
+            if replacement_request is not None:
+                conn.execute(
+                    """
+                    UPDATE queue_items
+                    SET work_kind=?, request_json=?, priority=?, updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (
+                        replacement_work_kind,
+                        _request_json(replacement_request),
+                        replacement_request.priority,
+                        now_s,
+                        existing["request_id"],
+                    ),
+                )
+                queue_item_changed = True
+            if upstream_budget_id is None and not bool(existing["unbudgeted_demand"]):
+                conn.execute(
+                    """
+                    UPDATE queue_items
+                    SET unbudgeted_demand=1, updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (now_s, existing["request_id"]),
+                )
+                queue_item_changed = True
+            if upstream_budget_id is not None:
+                attempts_total = int(existing["attempts_total"])
+                joins_current_attempt = (
+                    existing["status"] == RequestStatus.CLAIMED
+                    and not bool(existing["upstream_budget_gate_closed"])
+                )
+                first_attempt_number = max(
+                    1,
+                    attempts_total if joins_current_attempt else attempts_total + 1,
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_items
+                    SET upstream_budget_id=COALESCE(upstream_budget_id, ?),
+                        updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (upstream_budget_id, now_s, existing["request_id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO queue_item_upstream_budgets(
+                        request_id, budget_id, created_at, first_attempt_number
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        existing["request_id"],
+                        upstream_budget_id,
+                        now_s,
+                        first_attempt_number,
+                    ),
+                )
+                queue_item_changed = True
+            if queue_item_changed:
+                existing = conn.execute(
+                    "SELECT * FROM queue_items WHERE request_id = ?",
+                    (existing["request_id"],),
+                ).fetchone()
+            assert existing is not None
+            return _queue_item_from_row(existing), True
+        request_id = str(uuid4())
+        conn.execute(
+            """
+            INSERT INTO queue_items(
+                request_id, cache_key, client_id, request_json, priority, status, work_kind,
+                upstream_budget_id, unbudgeted_demand, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                cache_key,
+                request.client_id,
+                _request_json(request),
+                request.priority,
+                work_kind,
+                upstream_budget_id,
+                int(upstream_budget_id is None),
+                now_s,
+                now_s,
+            ),
+        )
+        if upstream_budget_id is not None:
             conn.execute(
                 """
-                INSERT INTO queue_items(
-                    request_id, cache_key, client_id, request_json, priority, status, work_kind,
-                    created_at, updated_at
+                INSERT INTO queue_item_upstream_budgets(
+                    request_id, budget_id, created_at, first_attempt_number
                 )
-                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                VALUES (?, ?, ?, 1)
                 """,
-                (
-                    request_id,
-                    key,
-                    request.client_id,
-                    _request_json(request),
-                    request.priority,
-                    resolved_work_kind,
-                    now_s,
-                    now_s,
-                ),
+                (request_id, upstream_budget_id, now_s),
             )
-            self._record_event_conn(
-                conn,
-                "request_enqueued",
-                {
-                    "request_id": request_id,
-                    "cache_key": key,
-                    "client_id": request.client_id,
-                },
-            )
-            row = conn.execute("SELECT * FROM queue_items WHERE request_id = ?", (request_id,)).fetchone()
+        self._record_event_conn(
+            conn,
+            "request_enqueued",
+            {
+                "request_id": request_id,
+                "cache_key": cache_key,
+                "client_id": request.client_id,
+                "work_kind": work_kind,
+            },
+        )
+        row = conn.execute("SELECT * FROM queue_items WHERE request_id = ?", (request_id,)).fetchone()
         assert row is not None
         return _queue_item_from_row(row), False
 
@@ -1250,11 +2210,11 @@ class HuldraStore:
             return None
         if request_ids is not None and not request_ids:
             return None
-        current = ensure_utc(now or utc_now())
-        current_s = isoformat_or_none(current)
-        claim_until = isoformat_or_none(current + timedelta(seconds=claim_timeout_seconds))
-        assert current_s is not None and claim_until is not None
         with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            current_s = isoformat_or_none(current)
+            claim_until = isoformat_or_none(current + timedelta(seconds=claim_timeout_seconds))
+            assert current_s is not None and claim_until is not None
             filters: list[str] = []
             params: list[object] = []
             if cache_keys is not None:
@@ -1293,6 +2253,7 @@ class HuldraStore:
                 SET status='claimed',
                     claimed_by=?,
                     claimed_until=?,
+                    upstream_budget_gate_closed=0,
                     attempts_total=attempts_total + 1,
                     updated_at=?
                 WHERE request_id=?
@@ -1305,6 +2266,40 @@ class HuldraStore:
         assert updated is not None
         return _queue_item_from_row(updated)
 
+    def renew_queue_claim(
+        self,
+        request_id: str,
+        *,
+        owner_token: str,
+        claim_timeout_seconds: int,
+        now: datetime | None = None,
+    ) -> QueueItem | None:
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            current_s = isoformat_or_none(current)
+            claim_until = isoformat_or_none(
+                current + timedelta(seconds=claim_timeout_seconds)
+            )
+            assert current_s is not None and claim_until is not None
+            updated = conn.execute(
+                """
+                UPDATE queue_items
+                SET claimed_until=?, updated_at=?
+                WHERE request_id=?
+                  AND status='claimed'
+                  AND claimed_by=?
+                """,
+                (claim_until, current_s, request_id, owner_token),
+            )
+            if updated.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM queue_items WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        assert row is not None
+        return _queue_item_from_row(row)
+
     def acquire_id_fetch_reservations(
         self,
         arxiv_ids: list[str] | tuple[str, ...],
@@ -1316,13 +2311,13 @@ class HuldraStore:
     ) -> IdReservationResult:
         if not arxiv_ids:
             return IdReservationResult(acquired_ids=(), blocked_until=None)
-        current = ensure_utc(now or utc_now())
-        current_s = isoformat_or_none(current)
-        expires_at = current + timedelta(seconds=ttl_seconds)
-        expires_s = isoformat_or_none(expires_at)
-        assert current_s is not None and expires_s is not None
         ids = tuple(dict.fromkeys(arxiv_ids))
         with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            current_s = isoformat_or_none(current)
+            expires_at = current + timedelta(seconds=ttl_seconds)
+            expires_s = isoformat_or_none(expires_at)
+            assert current_s is not None and expires_s is not None
             conn.execute(
                 "DELETE FROM id_fetch_reservations WHERE expires_at <= ?",
                 (current_s,),
@@ -1359,6 +2354,42 @@ class HuldraStore:
                     (arxiv_id, owner_token, request_id, current_s, expires_s),
                 )
         return IdReservationResult(acquired_ids=ids, blocked_until=None)
+
+    def renew_id_fetch_reservations(
+        self,
+        arxiv_ids: list[str] | tuple[str, ...],
+        *,
+        owner_token: str,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        ids = tuple(dict.fromkeys(arxiv_ids))
+        if not ids:
+            return True
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            current_s = isoformat_or_none(current)
+            expires_s = isoformat_or_none(current + timedelta(seconds=ttl_seconds))
+            assert current_s is not None and expires_s is not None
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT arxiv_id, owner_token FROM id_fetch_reservations "
+                f"WHERE arxiv_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            if len(rows) != len(ids) or any(
+                row["owner_token"] != owner_token for row in rows
+            ):
+                return False
+            updated = conn.execute(
+                f"""
+                UPDATE id_fetch_reservations
+                SET acquired_at=?, expires_at=?
+                WHERE owner_token=? AND arxiv_id IN ({placeholders})
+                """,
+                (current_s, expires_s, owner_token, *ids),
+            )
+        return updated.rowcount == len(ids)
 
     def release_id_fetch_reservations(
         self,
@@ -1410,6 +2441,7 @@ class HuldraStore:
                 updated_at=?,
                 claimed_by=NULL,
                 claimed_until=NULL,
+                upstream_budget_gate_closed=0,
                 error_category=NULL,
                 error_message=NULL
             WHERE request_id IN ({placeholders})
@@ -1455,6 +2487,7 @@ class HuldraStore:
                 UPDATE queue_items
                 SET status=?, next_attempt_at=?, updated_at=?,
                     claimed_by=NULL, claimed_until=NULL,
+                    upstream_budget_gate_closed=0,
                     error_category=?, error_message=?
                 WHERE request_id=?
                 """,
@@ -1476,11 +2509,11 @@ class HuldraStore:
         *,
         now: datetime | None = None,
     ) -> bool:
-        current = ensure_utc(now or utc_now())
-        current_s = isoformat_or_none(current)
-        expires_s = isoformat_or_none(current + timedelta(seconds=timeout_seconds))
-        assert current_s is not None and expires_s is not None
         with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            current_s = isoformat_or_none(current)
+            expires_s = isoformat_or_none(current + timedelta(seconds=timeout_seconds))
+            assert current_s is not None and expires_s is not None
             existing = conn.execute("SELECT * FROM leases WHERE name = ?", (name,)).fetchone()
             if existing is not None:
                 expires_at = from_isoformat_or_none(existing["expires_at"])
@@ -1498,6 +2531,124 @@ class HuldraStore:
                 (name, owner_token, current_s, expires_s),
             )
         return True
+
+    def renew_lease_if_owned(
+        self,
+        name: str,
+        owner_token: str,
+        timeout_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend an existing lease without ever reacquiring a lost lease."""
+        return self.renew_leases_if_owned(
+            ((name, owner_token, timeout_seconds),),
+            now=now,
+        )
+
+    def renew_leases_if_owned(
+        self,
+        leases: tuple[tuple[str, str, int], ...],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically extend every listed lease only while all owners still match."""
+        if not leases:
+            return True
+        if len({name for name, _owner, _timeout in leases}) != len(leases):
+            raise ValueError("lease names must be unique")
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            rows = {
+                str(row["name"]): row
+                for row in conn.execute(
+                    f"SELECT name, owner_token FROM leases WHERE name IN "
+                    f"({','.join('?' for _ in leases)})",
+                    tuple(name for name, _owner, _timeout in leases),
+                ).fetchall()
+            }
+            if any(
+                name not in rows or rows[name]["owner_token"] != owner_token
+                for name, owner_token, _timeout in leases
+            ):
+                return False
+            for name, owner_token, timeout_seconds in leases:
+                expires_s = isoformat_or_none(
+                    current + timedelta(seconds=timeout_seconds)
+                )
+                assert expires_s is not None
+                conn.execute(
+                    "UPDATE leases SET expires_at=? WHERE name=? AND owner_token=?",
+                    (expires_s, name, owner_token),
+                )
+        return True
+
+    def renew_worker_fetch_ownership(
+        self,
+        *,
+        request_id: str,
+        owner_token: str,
+        lease_name: str,
+        ttl_seconds: int,
+        reserved_ids: tuple[str, ...] = (),
+        now: datetime | None = None,
+    ) -> str | None:
+        """Atomically fence the queue claim, upstream lease, and ID reservations."""
+        ids = tuple(dict.fromkeys(reserved_ids))
+        placeholders = ",".join("?" for _ in ids)
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            current_s = isoformat_or_none(current)
+            expires_s = isoformat_or_none(current + timedelta(seconds=ttl_seconds))
+            assert current_s is not None and expires_s is not None
+            lease = conn.execute(
+                "SELECT owner_token FROM leases WHERE name=?",
+                (lease_name,),
+            ).fetchone()
+            if lease is None or lease["owner_token"] != owner_token:
+                return "lost_lease"
+            queue_item = conn.execute(
+                "SELECT status, claimed_by FROM queue_items WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if (
+                queue_item is None
+                or queue_item["status"] != "claimed"
+                or queue_item["claimed_by"] != owner_token
+            ):
+                return "lost_claim"
+            if ids:
+                reservations = conn.execute(
+                    f"SELECT arxiv_id, owner_token FROM id_fetch_reservations "
+                    f"WHERE arxiv_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                if len(reservations) != len(ids) or any(
+                    row["owner_token"] != owner_token for row in reservations
+                ):
+                    return "id_fetch_reserved"
+            conn.execute(
+                "UPDATE leases SET expires_at=? WHERE name=? AND owner_token=?",
+                (expires_s, lease_name, owner_token),
+            )
+            conn.execute(
+                """
+                UPDATE queue_items
+                SET claimed_until=?, updated_at=?
+                WHERE request_id=? AND status='claimed' AND claimed_by=?
+                """,
+                (expires_s, current_s, request_id, owner_token),
+            )
+            if ids:
+                conn.execute(
+                    f"""
+                    UPDATE id_fetch_reservations
+                    SET acquired_at=?, expires_at=?
+                    WHERE owner_token=? AND arxiv_id IN ({placeholders})
+                    """,
+                    (current_s, expires_s, owner_token, *ids),
+                )
+        return None
 
     def release_lease(self, name: str, owner_token: str) -> None:
         with self.begin_immediate() as conn:
@@ -1605,11 +2756,34 @@ class HuldraStore:
             upstream = conn.execute(
                 "SELECT COALESCE(SUM(upstream_requests_total), 0) AS total FROM cache_entries"
             ).fetchone()
-            errors_429 = conn.execute(
-                "SELECT COALESCE(SUM(upstream_429_total), 0) AS total FROM rate_state"
+            rate_totals = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(upstream_rate_limited_total), 0) AS rate_limited,
+                    COALESCE(SUM(upstream_429_total), 0) AS http_429,
+                    COALESCE(SUM(upstream_oai_503_retry_after_total), 0) AS oai_503,
+                    COALESCE(SUM(consecutive_rate_limit_total), 0) AS consecutive
+                FROM rate_state
+                """
             ).fetchone()
             rate = conn.execute(
-                "SELECT cooldown_until FROM rate_state WHERE name = 'arxiv_legacy_api'"
+                """
+                SELECT
+                    cooldown_until,
+                    consecutive_rate_limit_total,
+                    upstream_rate_limited_total,
+                    upstream_429_total,
+                    upstream_oai_503_retry_after_total,
+                    last_request_started_at,
+                    last_rate_wait_seconds,
+                    last_request_latency_ms,
+                    last_retry_after_seconds,
+                    last_effective_cooldown_seconds,
+                    last_rate_limit_kind,
+                    last_api_family
+                FROM rate_state
+                WHERE name = 'arxiv_legacy_api'
+                """
             ).fetchone()
             queue = conn.execute(
                 """
@@ -1668,9 +2842,23 @@ class HuldraStore:
         cooldown_until = from_isoformat_or_none(rate["cooldown_until"]) if rate else None
         return BrokerStatus(
             upstream_requests_total=int(upstream["total"]),
-            upstream_429_total=int(errors_429["total"]),
+            upstream_429_total=int(rate_totals["http_429"]),
+            upstream_rate_limited_total=int(rate_totals["rate_limited"]),
+            upstream_oai_503_retry_after_total=int(rate_totals["oai_503"]),
+            consecutive_rate_limit_total=int(rate_totals["consecutive"]),
             cooldown_until=cooldown_until,
             cooldown_active=cooldown_until is not None and cooldown_until > current,
+            last_request_started_at=(
+                from_isoformat_or_none(rate["last_request_started_at"]) if rate else None
+            ),
+            last_rate_wait_seconds=(rate["last_rate_wait_seconds"] if rate else None),
+            last_request_latency_ms=(rate["last_request_latency_ms"] if rate else None),
+            last_retry_after_seconds=(rate["last_retry_after_seconds"] if rate else None),
+            last_effective_cooldown_seconds=(
+                rate["last_effective_cooldown_seconds"] if rate else None
+            ),
+            last_rate_limit_kind=(rate["last_rate_limit_kind"] if rate else None),
+            last_api_family=(rate["last_api_family"] if rate else None),
             queue_depth_total=int(queue["depth"] or 0),
             queue_ready_total=int(queue["ready"] or 0),
             queue_delayed_total=int(queue["delayed"] or 0),
@@ -1741,6 +2929,23 @@ class HuldraStore:
                 """,
                 (cutoff_s, cutoff_s),
             ).rowcount
+            conn.execute(
+                """
+                DELETE FROM upstream_request_budgets AS budget
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM queue_items AS item
+                    WHERE item.upstream_budget_id = budget.budget_id
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM queue_item_upstream_budgets AS membership
+                    WHERE membership.budget_id = budget.budget_id
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sync_jobs AS job
+                    WHERE job.upstream_budget_id = budget.budget_id
+                )
+                """
+            )
 
         deleted = (
             events_deleted,
@@ -1999,12 +3204,202 @@ def _oai_base_paper_row_for_versioned_read(conn: sqlite3.Connection, arxiv_id: s
     ).fetchone()
 
 
+def _latest_versioned_paper_row_for_base_read(
+    conn: sqlite3.Connection,
+    arxiv_id: str,
+) -> sqlite3.Row | None:
+    if arxiv_version(arxiv_id) is not None:
+        return None
+    base_id = arxiv_id_family_base(arxiv_id)
+    rows = conn.execute(
+        "SELECT * FROM papers WHERE arxiv_id LIKE ? ESCAPE '\\'",
+        (f"{_sqlite_like_escape(base_id)}v%",),
+    ).fetchall()
+    matching = [
+        row
+        for row in rows
+        if arxiv_version(str(row["arxiv_id"])) is not None
+        and arxiv_id_family_base(str(row["arxiv_id"])) == base_id
+    ]
+    if not matching:
+        return None
+    return max(
+        matching,
+        key=lambda row: _version_family_merge_preference(str(row["arxiv_id"])),
+    )
+
+
 def _version_family_merge_preference(arxiv_id: str) -> tuple[int, str]:
     return (arxiv_version(arxiv_id) or -1, arxiv_id)
 
 
 def _sqlite_like_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _queue_item_upstream_budget_ids_conn(
+    conn: sqlite3.Connection,
+    request_id: str,
+) -> tuple[str, ...]:
+    queue_item = conn.execute(
+        "SELECT upstream_budget_id FROM queue_items WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if queue_item is None:
+        return ()
+    memberships = conn.execute(
+        """
+        SELECT budget_id
+        FROM queue_item_upstream_budgets
+        WHERE request_id=?
+        ORDER BY created_at, budget_id
+        """,
+        (request_id,),
+    ).fetchall()
+    budget_ids = [str(row["budget_id"]) for row in memberships]
+    primary_budget_id = queue_item["upstream_budget_id"]
+    if primary_budget_id is not None:
+        budget_ids.insert(0, str(primary_budget_id))
+    return tuple(dict.fromkeys(budget_ids))
+
+
+@dataclass(frozen=True, slots=True)
+class _QueueItemBudgetAttemptState:
+    attempt_number: int
+    unbudgeted_demand: bool
+    active_budget_ids: tuple[str, ...]
+    uncharged_budget_ids: tuple[str, ...]
+    future_budget_ids: tuple[str, ...]
+
+
+def _queue_item_upstream_budget_attempt_state_conn(
+    conn: sqlite3.Connection,
+    request_id: str,
+) -> _QueueItemBudgetAttemptState:
+    queue_item = conn.execute(
+        "SELECT attempts_total, unbudgeted_demand FROM queue_items WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if queue_item is None:
+        return _QueueItemBudgetAttemptState(0, False, (), (), ())
+    attempt_number = int(queue_item["attempts_total"])
+    memberships = conn.execute(
+        """
+        SELECT budget_id, first_attempt_number, last_charged_attempt
+        FROM queue_item_upstream_budgets
+        WHERE request_id=?
+        ORDER BY created_at, budget_id
+        """,
+        (request_id,),
+    ).fetchall()
+    active_budget_ids = tuple(
+        str(row["budget_id"])
+        for row in memberships
+        if int(row["first_attempt_number"]) <= attempt_number
+    )
+    uncharged_budget_ids = tuple(
+        str(row["budget_id"])
+        for row in memberships
+        if int(row["first_attempt_number"]) <= attempt_number
+        and int(row["last_charged_attempt"]) < attempt_number
+    )
+    future_budget_ids = tuple(
+        str(row["budget_id"])
+        for row in memberships
+        if int(row["first_attempt_number"]) > attempt_number
+    )
+    return _QueueItemBudgetAttemptState(
+        attempt_number=attempt_number,
+        unbudgeted_demand=bool(queue_item["unbudgeted_demand"]),
+        active_budget_ids=active_budget_ids,
+        uncharged_budget_ids=uncharged_budget_ids,
+        future_budget_ids=future_budget_ids,
+    )
+
+
+def _detach_queue_budget_memberships_conn(
+    conn: sqlite3.Connection,
+    request_id: str,
+    budget_ids: tuple[str, ...],
+) -> None:
+    if budget_ids:
+        placeholders = ",".join("?" for _ in budget_ids)
+        conn.execute(
+            f"""
+            DELETE FROM queue_item_upstream_budgets
+            WHERE request_id=? AND budget_id IN ({placeholders})
+            """,
+            (request_id, *budget_ids),
+        )
+    replacement = conn.execute(
+        """
+        SELECT budget_id
+        FROM queue_item_upstream_budgets
+        WHERE request_id=?
+        ORDER BY created_at, budget_id
+        LIMIT 1
+        """,
+        (request_id,),
+    ).fetchone()
+    conn.execute(
+        "UPDATE queue_items SET upstream_budget_id=? WHERE request_id=?",
+        (str(replacement["budget_id"]) if replacement is not None else None, request_id),
+    )
+
+
+def _upstream_budget_errors_conn(
+    conn: sqlite3.Connection,
+    budget_ids: tuple[str, ...],
+    *,
+    current: datetime,
+    enforce_request_limit: bool,
+) -> dict[str, str]:
+    errors: dict[str, str] = {}
+    for budget_id in dict.fromkeys(budget_ids):
+        budget = conn.execute(
+            """
+            SELECT deadline_at, requests_started, max_requests
+            FROM upstream_request_budgets
+            WHERE budget_id=?
+            """,
+            (budget_id,),
+        ).fetchone()
+        if budget is None:
+            errors[budget_id] = "request_budget_exceeded"
+            continue
+        deadline_at = from_isoformat_or_none(budget["deadline_at"])
+        if deadline_at is not None and current >= deadline_at:
+            errors[budget_id] = "deadline_budget_exceeded"
+        elif enforce_request_limit and int(budget["requests_started"]) >= int(
+            budget["max_requests"]
+        ):
+            errors[budget_id] = "request_budget_exceeded"
+    return errors
+
+
+def _preferred_upstream_budget_error(invalid_budgets: dict[str, str]) -> str:
+    if "deadline_budget_exceeded" in invalid_budgets.values():
+        return "deadline_budget_exceeded"
+    return "request_budget_exceeded"
+
+
+def _check_upstream_budget_deadlines_conn(
+    conn: sqlite3.Connection,
+    budget_ids: tuple[str, ...],
+    *,
+    current: datetime,
+) -> str | None:
+    for budget_id in budget_ids:
+        budget = conn.execute(
+            "SELECT deadline_at FROM upstream_request_budgets WHERE budget_id=?",
+            (budget_id,),
+        ).fetchone()
+        if budget is None:
+            return "request_budget_exceeded"
+        deadline_at = from_isoformat_or_none(budget["deadline_at"])
+        if deadline_at is not None and current >= deadline_at:
+            return "deadline_budget_exceeded"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2021,6 +3416,7 @@ def _cache_entry_from_row(row: sqlite3.Row) -> CacheEntry:
         status=row["status"],
         requested_at=from_isoformat_or_none(row["requested_at"]),
         completed_at=from_isoformat_or_none(row["completed_at"]),
+        refresh_after=from_isoformat_or_none(row["refresh_after"]),
         cooldown_until=from_isoformat_or_none(row["cooldown_until"]),
         upstream_status=row["upstream_status"],
         upstream_requests_total=int(row["upstream_requests_total"]),
@@ -2032,6 +3428,26 @@ def _cache_entry_from_row(row: sqlite3.Row) -> CacheEntry:
     )
 
 
+def _oai_harvest_state_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "harvest_id": row["harvest_id"],
+        "request": _oai_request_from_json(row["request_json"]),
+        "status": row["status"],
+        "records_processed": int(row["records_processed"]),
+        "papers_upserted": int(row["papers_upserted"]),
+        "deleted_records": int(row["deleted_records"]),
+        "pages_total": int(row["pages_total"]),
+        "requests_total": int(row["requests_total"]),
+        "resumption_token": row["resumption_token"],
+        "last_response_date": row["last_response_date"],
+        "last_datestamp_seen": row["last_datestamp_seen"],
+        "deadline_at": from_isoformat_or_none(row["deadline_at"]),
+        "finished_paging": bool(row["finished_paging"]),
+        "error_category": row["error_category"],
+        "error_message": row["error_message"],
+    }
+
+
 def _queue_item_from_row(row: sqlite3.Row) -> QueueItem:
     return QueueItem(
         request_id=row["request_id"],
@@ -2041,6 +3457,7 @@ def _queue_item_from_row(row: sqlite3.Row) -> QueueItem:
         priority=int(row["priority"]),
         status=row["status"],
         work_kind=row["work_kind"],
+        upstream_budget_id=row["upstream_budget_id"],
         created_at=from_isoformat_or_none(row["created_at"]) or utc_now(),
         updated_at=from_isoformat_or_none(row["updated_at"]) or utc_now(),
         claimed_by=row["claimed_by"],

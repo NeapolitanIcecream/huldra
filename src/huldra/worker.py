@@ -4,6 +4,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import ceil
 from typing import Protocol
 from uuid import uuid4
 
@@ -184,11 +185,74 @@ class HuldraWorker:
             assert callable(sleeper)
             sleeper(decision.wait_seconds)
 
+        ownership_ttl = self._fetch_ownership_ttl(item)
+        id_plan, ownership_result = self._gate_fetch_ownership(
+            item,
+            id_plan,
+            ttl_seconds=ownership_ttl,
+        )
+        if ownership_result is not None:
+            return ownership_result
+
+        budget_error = self.store.reserve_queue_item_upstream_request(item.request_id)
+        if budget_error is None:
+            budget_error = self.store.check_queue_item_upstream_request_deadlines(
+                item.request_id
+            )
+        if budget_error == "budget_deferred":
+            return self._defer_budgeted_item(item, id_plan)
+        if budget_error is not None:
+            return self._fail_budgeted_item(item, id_plan, budget_error)
+        # Durable budget accounting may itself wait on SQLite long enough for
+        # every earlier TTL to expire. Conservatively consumed budget remains
+        # consumed if this final ownership fence decides not to issue I/O.
+        id_plan, ownership_result = self._gate_fetch_ownership(
+            item,
+            id_plan,
+            ttl_seconds=ownership_ttl,
+        )
+        if ownership_result is not None:
+            return ownership_result
+        budget_error = self.store.check_queue_item_upstream_request_deadlines(
+            item.request_id
+        )
+        if budget_error == "budget_deferred":
+            return self._defer_budgeted_item(item, id_plan)
+        if budget_error is not None:
+            return self._fail_budgeted_item(item, id_plan, budget_error)
         fetch_request = (
             id_plan.fetch_request
             if id_plan is not None and id_plan.fetch_request is not None
             else item.request
         )
+        budget_deadline = self.store.queue_item_upstream_deadline(item.request_id)
+        if budget_deadline is not None:
+            remaining_budget_seconds = (budget_deadline - utc_now()).total_seconds()
+            if remaining_budget_seconds <= 0:
+                budget_error = self.store.check_queue_item_upstream_request_deadlines(
+                    item.request_id
+                )
+                if budget_error == "budget_deferred":
+                    return self._defer_budgeted_item(item, id_plan)
+                if budget_error is not None:
+                    return self._fail_budgeted_item(item, id_plan, budget_error)
+                budget_deadline = self.store.queue_item_upstream_deadline(
+                    item.request_id
+                )
+                remaining_budget_seconds = (
+                    (budget_deadline - utc_now()).total_seconds()
+                    if budget_deadline is not None
+                    else self.settings.request_timeout_seconds
+                )
+            fetch_request = fetch_request.model_copy(
+                update={
+                    "timeout_seconds": min(
+                        fetch_request.timeout_seconds
+                        or self.settings.request_timeout_seconds,
+                        remaining_budget_seconds,
+                    )
+                }
+            )
         try:
             result = self.fetcher.fetch(fetch_request)
         except RateLimitedError as exc:
@@ -372,6 +436,226 @@ class HuldraWorker:
             papers_total=len(papers),
         )
 
+    def _fetch_ownership_ttl(self, item: QueueItem) -> int:
+        request_timeout = item.request.timeout_seconds or self.settings.request_timeout_seconds
+        return max(
+            self.settings.queue_claim_timeout_seconds,
+            self.settings.lease_timeout_seconds,
+            ceil(request_timeout + self.store.timeout + 5.0),
+        )
+
+    def _defer_budgeted_item(
+        self,
+        item: QueueItem,
+        id_plan: _IdListFetchPlan | None,
+    ) -> WorkerPassResult:
+        self.store.release_lease(self.limiter.lease_name, self.owner_token)
+        next_attempt = utc_now()
+        error_category = "budget_deferred"
+        error_message = "upstream budget applies to the next queue attempt"
+        self.store.release_or_delay_queue_item(
+            item.request_id,
+            next_attempt_at=next_attempt,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        self._release_id_plan(id_plan)
+        self.store.record_worker_completed(
+            name=self.name,
+            next_wake_at=next_attempt,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        return WorkerPassResult(
+            status="blocked",
+            request_id=item.request_id,
+            cache_key=item.cache_key,
+            cooldown_until=next_attempt,
+            error_category=error_category,
+            error_message=error_message,
+        )
+
+    def _fail_budgeted_item(
+        self,
+        item: QueueItem,
+        id_plan: _IdListFetchPlan | None,
+        error_category: str,
+    ) -> WorkerPassResult:
+        self.store.release_lease(self.limiter.lease_name, self.owner_token)
+        error_message = error_category.replace("_", " ")
+        self.store.record_cache_failure(
+            cache_key=item.cache_key,
+            request=item.request,
+            error_category=error_category,
+            error_message=error_message,
+            upstream_request_count=0,
+        )
+        self.store.release_or_delay_queue_item(
+            item.request_id,
+            status=RequestStatus.FAILED,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        self._release_id_plan(id_plan)
+        self.store.record_worker_completed(
+            name=self.name,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        return WorkerPassResult(
+            status="budget_exceeded",
+            request_id=item.request_id,
+            cache_key=item.cache_key,
+            error_category=error_category,
+            error_message=error_message,
+        )
+
+    def _gate_fetch_ownership(
+        self,
+        item: QueueItem,
+        id_plan: _IdListFetchPlan | None,
+        *,
+        ttl_seconds: int,
+    ) -> tuple[_IdListFetchPlan | None, WorkerPassResult | None]:
+        reason = self.store.renew_worker_fetch_ownership(
+            request_id=item.request_id,
+            owner_token=self.owner_token,
+            lease_name=self.limiter.lease_name,
+            ttl_seconds=ttl_seconds,
+            reserved_ids=id_plan.reserved_ids if id_plan is not None else (),
+        )
+        if reason is not None:
+            return id_plan, self._fetch_ownership_failure(item, id_plan, reason)
+
+        cached = self.store.get_readable_completed_cache(item.cache_key)
+        if cached is not None and item.work_kind == QueueWorkKind.FETCH_MISSING:
+            self.store.release_lease(self.limiter.lease_name, self.owner_token)
+            self.store.complete_queue_item(item.request_id)
+            self._release_id_plan(id_plan)
+            self.store.record_worker_completed(name=self.name)
+            return id_plan, WorkerPassResult(
+                status="cache_hit",
+                request_id=item.request_id,
+                cache_key=item.cache_key,
+                papers_total=cached.result_count,
+            )
+
+        if id_plan is not None:
+            id_plan = self._revalidate_id_list_fetch_plan(
+                item,
+                id_plan,
+                ttl_seconds=ttl_seconds,
+            )
+            if id_plan.blocked_until is not None:
+                self.store.release_lease(self.limiter.lease_name, self.owner_token)
+                self.store.release_or_delay_queue_item(
+                    item.request_id,
+                    next_attempt_at=id_plan.blocked_until,
+                    error_category="id_fetch_reserved",
+                    error_message="id fetch reservation changed before network I/O",
+                )
+                self._release_id_plan(id_plan)
+                self.store.record_worker_completed(
+                    name=self.name,
+                    next_wake_at=id_plan.blocked_until,
+                    error_category="id_fetch_reserved",
+                    error_message="id fetch reservation changed before network I/O",
+                )
+                return id_plan, WorkerPassResult(
+                    status="blocked",
+                    request_id=item.request_id,
+                    cache_key=item.cache_key,
+                    cooldown_until=id_plan.blocked_until,
+                    error_category="id_fetch_reserved",
+                )
+            if id_plan.fetch_request is None:
+                assert id_plan.papers_by_id is not None
+                papers = [
+                    id_plan.papers_by_id[arxiv_id]
+                    for arxiv_id in id_plan.requested_ids
+                ]
+                self.store.release_lease(self.limiter.lease_name, self.owner_token)
+                self.store.record_completed_cache_entry(
+                    cache_key=item.cache_key,
+                    request=item.request,
+                    papers=papers,
+                    total_results=len(papers),
+                    upstream_request_count=0,
+                )
+                self.store.complete_queue_item(item.request_id)
+                self._release_id_plan(id_plan)
+                self.store.record_worker_completed(name=self.name)
+                return id_plan, WorkerPassResult(
+                    status="cache_hit",
+                    request_id=item.request_id,
+                    cache_key=item.cache_key,
+                    papers_total=len(papers),
+                )
+
+        # The cache and ID checks use their own transactions. End with one
+        # atomic fence so no SQLite wait can leave mixed ownership at fetch time.
+        reason = self.store.renew_worker_fetch_ownership(
+            request_id=item.request_id,
+            owner_token=self.owner_token,
+            lease_name=self.limiter.lease_name,
+            ttl_seconds=ttl_seconds,
+            reserved_ids=id_plan.reserved_ids if id_plan is not None else (),
+        )
+        if reason is not None:
+            return id_plan, self._fetch_ownership_failure(item, id_plan, reason)
+        return id_plan, None
+
+    def _fetch_ownership_failure(
+        self,
+        item: QueueItem,
+        id_plan: _IdListFetchPlan | None,
+        reason: str,
+    ) -> WorkerPassResult:
+        self.store.release_lease(self.limiter.lease_name, self.owner_token)
+        if reason == "id_fetch_reserved":
+            next_attempt = utc_now() + timedelta(
+                seconds=self.settings.worker_poll_interval_seconds
+            )
+            self.store.release_or_delay_queue_item(
+                item.request_id,
+                next_attempt_at=next_attempt,
+                error_category=reason,
+                error_message="id fetch reservation changed before network I/O",
+            )
+            self._release_id_plan(id_plan)
+            self.store.record_worker_completed(
+                name=self.name,
+                next_wake_at=next_attempt,
+                error_category=reason,
+                error_message="id fetch reservation changed before network I/O",
+            )
+            return WorkerPassResult(
+                status="blocked",
+                request_id=item.request_id,
+                cache_key=item.cache_key,
+                cooldown_until=next_attempt,
+                error_category=reason,
+            )
+
+        self._release_id_plan(id_plan)
+        error_message = (
+            "upstream lease changed before network I/O"
+            if reason == "lost_lease"
+            else "queue claim changed before network I/O"
+        )
+        self.store.record_worker_completed(
+            name=self.name,
+            error_category=reason,
+            error_message=error_message,
+        )
+        return WorkerPassResult(
+            status=reason,
+            request_id=item.request_id,
+            cache_key=item.cache_key,
+            error_category=reason,
+            error_message=error_message,
+        )
+
     def _plan_id_list_fetch(self, item: QueueItem) -> _IdListFetchPlan | None:
         if item.work_kind != QueueWorkKind.FETCH_MISSING or not _is_pure_id_list_request(item.request):
             return None
@@ -410,6 +694,59 @@ class HuldraWorker:
                 plan.reserved_ids,
                 owner_token=self.owner_token,
             )
+
+    def _revalidate_id_list_fetch_plan(
+        self,
+        item: QueueItem,
+        plan: _IdListFetchPlan,
+        *,
+        ttl_seconds: int,
+    ) -> _IdListFetchPlan:
+        if not plan.reserved_ids:
+            return plan
+        papers_by_id = self.store.get_papers_by_ids(plan.requested_ids)
+        missing = tuple(
+            arxiv_id for arxiv_id in plan.requested_ids if arxiv_id not in papers_by_id
+        )
+        no_longer_missing = tuple(
+            arxiv_id for arxiv_id in plan.reserved_ids if arxiv_id not in missing
+        )
+        if no_longer_missing:
+            self.store.release_id_fetch_reservations(
+                no_longer_missing,
+                owner_token=self.owner_token,
+            )
+        still_reserved = tuple(
+            arxiv_id for arxiv_id in plan.reserved_ids if arxiv_id in missing
+        )
+        if not missing:
+            return _IdListFetchPlan(
+                requested_ids=plan.requested_ids,
+                papers_by_id=papers_by_id,
+            )
+        if set(still_reserved) != set(missing) or not self.store.renew_id_fetch_reservations(
+            still_reserved,
+            owner_token=self.owner_token,
+            ttl_seconds=ttl_seconds,
+        ):
+            return _IdListFetchPlan(
+                requested_ids=plan.requested_ids,
+                reserved_ids=still_reserved,
+                papers_by_id=papers_by_id,
+                blocked_until=utc_now()
+                + timedelta(seconds=self.settings.worker_poll_interval_seconds),
+            )
+        return _IdListFetchPlan(
+            requested_ids=plan.requested_ids,
+            fetch_request=item.request.model_copy(
+                update={
+                    "id_list": still_reserved,
+                    "cache_policy": CachePolicy.CACHE_OR_ENQUEUE,
+                }
+            ),
+            reserved_ids=still_reserved,
+            papers_by_id=papers_by_id,
+        )
 
 
 def _backoff_seconds(attempts_total: int) -> int:

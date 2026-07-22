@@ -142,11 +142,18 @@ def test_client_sync_windows_uses_http_api() -> None:
         )
     )
 
-    result = client.sync_windows([ArxivRequest(client_id="demo", search_query="cat:cs.AI")])
+    result = client.sync_windows(
+        [ArxivRequest(client_id="demo", search_query="cat:cs.AI")],
+        max_pages_per_window=7,
+        max_requests_total=8,
+    )
 
     assert result.requested_total == 1
     assert result.requests[0].raw_cache_status == "queued"
     assert requests[0].url.path == "/v1/sync"
+    payload = json.loads(requests[0].content)
+    assert payload["max_pages_per_window"] == 7
+    assert payload["max_requests_total"] == 8
 
 
 def test_client_sync_windows_surfaces_complete_window_wait_validation(

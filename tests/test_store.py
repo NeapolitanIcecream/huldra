@@ -214,7 +214,7 @@ def test_upsert_oai_record_merges_non_deleted_paper_into_versioned_legacy_row(
     )
 
     paper = store.get_paper("2401.00004v1")
-    duplicate = store.get_paper("2401.00004")
+    base_alias = store.get_paper("2401.00004")
     with store.connect() as conn:
         family_count = conn.execute(
             "SELECT COUNT(*) FROM papers WHERE arxiv_id IN ('2401.00004', '2401.00004v1')"
@@ -229,7 +229,8 @@ def test_upsert_oai_record_merges_non_deleted_paper_into_versioned_legacy_row(
     assert paper.oai_identifier == "oai:arXiv.org:2401.00004"
     assert paper.oai_datestamp == datestamp
     assert paper.oai_set_specs == ["cs:cs:AI"]
-    assert duplicate is None
+    assert base_alias is not None
+    assert base_alias.arxiv_id == "2401.00004v1"
     assert family_count == 1
 
 
@@ -432,11 +433,263 @@ def test_versioned_read_prefers_exact_row_over_oai_base_alias(
     assert papers_by_id["2401.00009v1"].arxiv_id == "2401.00009v1"
 
 
+def test_base_read_resolves_to_latest_legacy_version_for_single_and_batch_lookup(
+    store: HuldraStore,
+) -> None:
+    store.upsert_papers(
+        [
+            make_paper("2401.00010v1").model_copy(update={"title": "Version One"}),
+            make_paper("2401.00010v3").model_copy(update={"title": "Version Three"}),
+        ]
+    )
+
+    paper = store.get_paper("2401.00010")
+    papers_by_id = store.get_papers_by_ids(("2401.00010",))
+
+    assert paper is not None
+    assert paper.arxiv_id == "2401.00010v3"
+    assert paper.title == "Version Three"
+    assert papers_by_id["2401.00010"].arxiv_id == "2401.00010v3"
+
+
 def test_enqueue_dedupes_pending_cache_key(store: HuldraStore) -> None:
     request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
     first = store.enqueue_request(request)
     second = store.enqueue_request(request)
     assert second.request_id == first.request_id
+
+
+def test_enqueue_join_charges_all_maintenance_budgets_atomically(
+    store: HuldraStore,
+) -> None:
+    first_budget = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    second_budget = store.create_upstream_request_budget(max_requests=2, deadline_at=None)
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
+    first, joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=first_budget,
+    )
+    assert not joined
+
+    second, joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=second_budget,
+    )
+
+    assert joined
+    assert second.request_id == first.request_id
+    assert store.queue_item_upstream_budget_ids(first.request_id) == (
+        first_budget,
+        second_budget,
+    )
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(first.request_id) is None
+    assert store.reserve_queue_item_upstream_request(first.request_id) is None
+    store.release_or_delay_queue_item(first.request_id)
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(first.request_id) is None
+    assert store.queue_item_upstream_budget_ids(first.request_id) == (second_budget,)
+    with store.connect() as conn:
+        usage = dict(
+            conn.execute(
+                """
+                SELECT budget_id, requests_started
+                FROM upstream_request_budgets
+                WHERE budget_id IN (?, ?)
+                """,
+                (first_budget, second_budget),
+            ).fetchall()
+        )
+    assert usage == {first_budget: 1, second_budget: 2}
+    assert (
+        store.fail_active_upstream_budget_items(
+            second_budget,
+            error_category="deadline_budget_exceeded",
+            error_message="joined budget expired",
+        )
+        == 1
+    )
+    failed = store.get_queue_item(first.request_id)
+    assert failed is not None
+    assert failed.status == RequestStatus.FAILED
+
+
+def test_expired_joined_budget_does_not_cancel_unbudgeted_queue_demand(
+    store: HuldraStore,
+) -> None:
+    request = ArxivRequest(client_id="ordinary", search_query="cat:cs.AI")
+    item = store.enqueue_request(request)
+    budget_id = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    joined, joined_existing = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=budget_id,
+    )
+    assert joined_existing
+    assert joined.request_id == item.request_id
+
+    failed_total = store.fail_active_upstream_budget_items(
+        budget_id,
+        error_category="deadline_budget_exceeded",
+        error_message="maintenance deadline expired",
+    )
+
+    assert failed_total == 0
+    preserved = store.get_queue_item(item.request_id)
+    assert preserved is not None
+    assert preserved.status == RequestStatus.QUEUED
+    assert preserved.upstream_budget_id is None
+    assert store.queue_item_upstream_budget_ids(item.request_id) == ()
+    reconciled = [
+        event
+        for event in store.events()
+        if event["event_type"] == "upstream_budget_queue_reconciled"
+    ]
+    assert reconciled[-1]["payload"] == {
+        "budget_id": budget_id,
+        "detached_total": 1,
+        "error_category": "deadline_budget_exceeded",
+        "failed_total": 0,
+        "items_total": 1,
+        "preserved_total": 1,
+    }
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(item.request_id) is None
+
+
+def test_expired_joined_budget_does_not_cancel_another_budgeted_consumer(
+    store: HuldraStore,
+) -> None:
+    first_budget = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    second_budget = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    request = ArxivRequest(client_id="maintenance", search_query="cat:cs.AI")
+    item, _joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=first_budget,
+    )
+    store.enqueue_request_for_work(request, upstream_budget_id=second_budget)
+
+    failed_total = store.fail_active_upstream_budget_items(
+        first_budget,
+        error_category="deadline_budget_exceeded",
+        error_message="first maintenance deadline expired",
+    )
+
+    assert failed_total == 0
+    preserved = store.get_queue_item(item.request_id)
+    assert preserved is not None
+    assert preserved.status == RequestStatus.QUEUED
+    assert preserved.upstream_budget_id == second_budget
+    assert store.queue_item_upstream_budget_ids(item.request_id) == (second_budget,)
+
+
+def test_enqueue_join_attaches_budget_to_existing_unbudgeted_item(
+    store: HuldraStore,
+) -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
+    first = store.enqueue_request(request)
+    budget_id = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+
+    joined_item, joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=budget_id,
+    )
+
+    assert joined
+    assert joined_item.request_id == first.request_id
+    assert joined_item.upstream_budget_id == budget_id
+    assert store.queue_item_upstream_budget_ids(first.request_id) == (budget_id,)
+
+
+def test_claimed_queue_budget_gate_defers_late_join_to_next_attempt(
+    store: HuldraStore,
+) -> None:
+    first_budget = store.create_upstream_request_budget(max_requests=2, deadline_at=None)
+    second_budget = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI")
+    item, _joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=first_budget,
+    )
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(item.request_id) is None
+
+    _joined_item, joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=second_budget,
+    )
+    assert joined
+    assert store.reserve_queue_item_upstream_request(item.request_id) is None
+    with store.connect() as conn:
+        deferred = conn.execute(
+            """
+            SELECT first_attempt_number, last_charged_attempt
+            FROM queue_item_upstream_budgets
+            WHERE request_id=? AND budget_id=?
+            """,
+            (item.request_id, second_budget),
+        ).fetchone()
+        usage = conn.execute(
+            "SELECT requests_started FROM upstream_request_budgets WHERE budget_id=?",
+            (second_budget,),
+        ).fetchone()[0]
+    assert tuple(deferred) == (2, 0)
+    assert usage == 0
+
+    store.release_or_delay_queue_item(item.request_id)
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(item.request_id) is None
+    with store.connect() as conn:
+        usage = dict(
+            conn.execute(
+                """
+                SELECT budget_id, requests_started
+                FROM upstream_request_budgets
+                WHERE budget_id IN (?, ?)
+                """,
+                (first_budget, second_budget),
+            ).fetchall()
+        )
+    assert usage == {first_budget: 2, second_budget: 1}
+
+
+def test_removed_current_budget_defers_work_to_future_joined_budget(
+    store: HuldraStore,
+) -> None:
+    current_budget = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    future_budget = store.create_upstream_request_budget(max_requests=1, deadline_at=None)
+    request = ArxivRequest(client_id="maintenance", search_query="cat:cs.AI")
+    item, _joined = store.enqueue_request_for_work(
+        request,
+        upstream_budget_id=current_budget,
+    )
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(item.request_id) is None
+    store.enqueue_request_for_work(request, upstream_budget_id=future_budget)
+
+    assert (
+        store.fail_active_upstream_budget_items(
+            current_budget,
+            error_category="deadline_budget_exceeded",
+            error_message="current maintenance deadline expired",
+        )
+        == 0
+    )
+    assert (
+        store.check_queue_item_upstream_request_deadlines(item.request_id)
+        == "budget_deferred"
+    )
+
+    store.release_or_delay_queue_item(item.request_id)
+    claimed = store.claim_next_queue_item(owner_token="worker")
+    assert claimed is not None
+    assert store.reserve_queue_item_upstream_request(item.request_id) is None
+    assert store.queue_item_upstream_budget_ids(item.request_id) == (future_budget,)
 
 
 def test_claim_next_queue_item_is_exclusive_until_claim_expires(
@@ -475,6 +728,21 @@ def test_rate_state_and_leases_are_durable(store: HuldraStore) -> None:
     assert not store.acquire_lease("upstream_fetch", "w2", 60)
     store.release_lease("upstream_fetch", "w1")
     assert store.acquire_lease("upstream_fetch", "w2", 60)
+
+
+def test_strict_lease_renewal_never_reacquires_a_missing_or_replaced_lease(
+    store: HuldraStore,
+) -> None:
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    assert store.acquire_lease("upstream_fetch", "w1", 3, now=now)
+    assert store.renew_lease_if_owned("upstream_fetch", "w1", 10, now=now)
+
+    store.release_lease("upstream_fetch", "w1")
+    assert not store.renew_lease_if_owned("upstream_fetch", "w1", 10, now=now)
+
+    assert store.acquire_lease("upstream_fetch", "w2", 3, now=now)
+    assert not store.renew_lease_if_owned("upstream_fetch", "w1", 10, now=now)
+    assert store.renew_lease_if_owned("upstream_fetch", "w2", 10, now=now)
 
 
 def test_release_or_delay_marks_queue_item_failed(store: HuldraStore) -> None:

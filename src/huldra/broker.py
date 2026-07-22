@@ -5,13 +5,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
+from math import ceil
+from uuid import uuid4
 
 from loguru import logger
 
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
 from huldra.fetcher import NonRetryableFetchError, RateLimitedError, TransientFetchError
-from huldra.keys import normalize_arxiv_id, request_cache_key
+from huldra.keys import arxiv_id_family_base, normalize_arxiv_id, request_cache_key
 from huldra.limiter import HuldraRateLimiter
 from huldra.models import (
     ArxivRawInspectionResult,
@@ -64,6 +66,16 @@ class _MaintenanceTarget:
     aggregate_error_message: str | None = None
 
 
+@dataclass(slots=True)
+class _MaintenanceBudget:
+    upstream_budget_id: str
+    max_pages_per_window: int
+    max_requests_total: int
+    deadline: float
+    deadline_at: datetime
+    reserved_requests: int = 0
+
+
 class HuldraBroker:
     def __init__(
         self,
@@ -90,16 +102,22 @@ class HuldraBroker:
                 readiness_request=request,
             )
             if request.cache_policy == CachePolicy.STALE_WHILE_REVALIDATE:
-                item, _joined = self.store.enqueue_request_for_work(
+                item, _joined = self.store.enqueue_refresh_if_due(
                     request,
                     cache_key,
-                    work_kind=QueueWorkKind.REFRESH_COMPLETED,
+                    default_timeout_seconds=self.settings.request_timeout_seconds,
                 )
+                if item is None:
+                    return result
+                reserved = self.store.get_cache_entry(cache_key)
                 return result.model_copy(
                     update={
                         "stale": True,
                         "request_id": item.request_id,
                         "queued_at": item.created_at,
+                        "refresh_after": (
+                            reserved.refresh_after if reserved is not None else result.refresh_after
+                        ),
                     }
                 )
             return result
@@ -120,6 +138,7 @@ class HuldraBroker:
             request,
             cache_key,
             work_kind=QueueWorkKind.FETCH_MISSING,
+            default_timeout_seconds=self.settings.request_timeout_seconds,
         )
         rate = self.store.get_rate_state()
         if rate.cooldown_until is not None and rate.cooldown_until > utc_now():
@@ -194,11 +213,106 @@ class HuldraBroker:
         return self.store.status_summary()
 
     def harvest_oai(self, request: OaiHarvestRequest) -> OaiHarvestResult:
-        resumption_token = (
-            request.resumption_token
-            or self.store.get_latest_resumable_oai_harvest_token(request)
+        scope_lease_name = _oai_scope_lease_name(request)
+        scope_owner = f"oai-harvest:{uuid4()}"
+        scope_lease_seconds = max(
+            self.settings.lease_timeout_seconds,
+            ceil(
+                self.settings.request_timeout_seconds
+                + self.settings.request_interval_seconds
+                + self.store.timeout
+                + 10.0
+            ),
         )
-        harvest_id = self.store.create_oai_harvest_job(request)
+        if not self.store.acquire_lease(
+            scope_lease_name,
+            scope_owner,
+            scope_lease_seconds,
+        ):
+            running = self.store.get_running_oai_harvest(request)
+            if running is not None:
+                active = self.store.get_oai_harvest_result(str(running["harvest_id"]))
+                if active is not None:
+                    return active.model_copy(
+                        update={
+                            "status": "blocked",
+                            "error_category": "harvest_in_progress",
+                            "error_message": "an OAI harvest for this scope is already running",
+                        }
+                    )
+            return OaiHarvestResult(
+                harvest_id=scope_lease_name,
+                status="blocked",
+                metadata_prefix=request.metadata_prefix,
+                set_spec=request.set_spec,
+                mode=request.mode,
+                error_category="harvest_in_progress",
+                error_message="an OAI harvest for this scope is already starting",
+            )
+        try:
+            return self._harvest_oai_owned(
+                request,
+                scope_lease_name=scope_lease_name,
+                scope_owner=scope_owner,
+                scope_lease_seconds=scope_lease_seconds,
+            )
+        finally:
+            self.store.release_lease(scope_lease_name, scope_owner)
+
+    def _harvest_oai_owned(
+        self,
+        request: OaiHarvestRequest,
+        *,
+        scope_lease_name: str,
+        scope_owner: str,
+        scope_lease_seconds: int,
+    ) -> OaiHarvestResult:
+        running = self.store.get_running_oai_harvest(request)
+        if running is None:
+            resumption_token = (
+                request.resumption_token
+                or self.store.get_latest_resumable_oai_harvest_token(request)
+            )
+            harvest_id = self.store.create_oai_harvest_job(
+                request,
+                resumption_token=resumption_token,
+            )
+            effective_request = request
+            page_index = 0
+            requests_total = 0
+            records_processed = 0
+            papers_upserted = 0
+            deleted_records = 0
+            response_watermark = None
+            max_datestamp_seen = None
+            created = self.store.get_oai_harvest_result(harvest_id)
+            assert created is not None and created.deadline_at is not None
+            deadline_at = created.deadline_at
+            finished_paging = False
+            pending_error_category = None
+            pending_error_message = None
+        else:
+            harvest_id = str(running["harvest_id"])
+            effective_request = running["request"]
+            assert isinstance(effective_request, OaiHarvestRequest)
+            resumption_token = running["resumption_token"]
+            page_index = int(running["pages_total"])
+            requests_total = int(running["requests_total"])
+            records_processed = int(running["records_processed"])
+            papers_upserted = int(running["papers_upserted"])
+            deleted_records = int(running["deleted_records"])
+            response_watermark = running["last_response_date"]
+            max_datestamp_seen = running["last_datestamp_seen"]
+            deadline_at = running["deadline_at"]
+            if deadline_at is None:
+                deadline_at = self.store.ensure_oai_harvest_deadline(
+                    harvest_id,
+                    utc_now() + timedelta(seconds=effective_request.runtime_budget_seconds),
+                )
+            finished_paging = bool(running["finished_paging"])
+            pending_error_category = running["error_category"]
+            pending_error_message = running["error_message"]
+
         fetcher = self.oai_fetcher or OaiPmhFetcher(self.settings)
         # OAI-PMH and legacy Atom calls share arXiv's upstream throttle.
         # OAI-specific accounting stays in the harvest and page tables.
@@ -211,20 +325,96 @@ class HuldraBroker:
         from_datestamp = (
             None
             if resumption_token is not None
-            else self._oai_start_datestamp(request)
+            else self._oai_start_datestamp(effective_request)
         )
-        until_datestamp = _normalize_oai_day_datestamp(request.until_datestamp)
-        page_index = 0
-        records_processed = 0
-        papers_upserted = 0
-        deleted_records = 0
-        response_watermark = None
-        max_datestamp_seen = None
-        while True:
+        until_datestamp = _normalize_oai_day_datestamp(effective_request.until_datestamp)
+        consumed_token_hashes = self.store.get_oai_consumed_token_hashes(harvest_id)
+
+        def finish(
+            *,
+            status: str,
+            pages_total: int | None = None,
+            current_watermark: str | None = None,
+            token: str | None = None,
+            error_category: str | None = None,
+            error_message: str | None = None,
+        ) -> OaiHarvestResult:
+            return self.store.complete_oai_harvest_job(
+                harvest_id=harvest_id,
+                status=status,
+                records_processed=records_processed,
+                papers_upserted=papers_upserted,
+                deleted_records=deleted_records,
+                pages_total=page_index if pages_total is None else pages_total,
+                current_watermark=current_watermark,
+                resumption_token=token,
+                error_category=error_category,
+                error_message=error_message,
+            )
+
+        def ownership_lost() -> OaiHarvestResult:
+            # Never persist a terminal status after losing either lease: a
+            # successor may already be checkpointing the same durable job.
+            current = self.store.get_oai_harvest_result(harvest_id)
+            if current is None:
+                return OaiHarvestResult(
+                    harvest_id=harvest_id,
+                    status="blocked",
+                    metadata_prefix=effective_request.metadata_prefix,
+                    set_spec=effective_request.set_spec,
+                    mode=effective_request.mode,
+                    error_category="harvest_in_progress",
+                    error_message="OAI harvest ownership changed before network I/O",
+                )
+            if current.status != "running":
+                return current
+            return current.model_copy(
+                update={
+                    "status": "blocked",
+                    "error_category": "harvest_in_progress",
+                    "error_message": "OAI harvest ownership changed before network I/O",
+                }
+            )
+
+        if pending_error_category is not None:
+            return finish(
+                status="failed",
+                current_watermark=response_watermark,
+                token=resumption_token,
+                error_category=str(pending_error_category),
+                error_message=(
+                    str(pending_error_message)
+                    if pending_error_message is not None
+                    else str(pending_error_category).replace("_", " ")
+                ),
+            )
+
+        while not finished_paging:
+            renewed = self.store.renew_lease_if_owned(
+                scope_lease_name,
+                scope_owner,
+                scope_lease_seconds,
+            )
+            if not renewed:
+                return ownership_lost()
+            budget_error = _oai_budget_error(
+                effective_request,
+                pages_total=page_index,
+                requests_total=requests_total,
+                deadline_at=deadline_at,
+            )
+            if budget_error is not None:
+                return finish(
+                    status="budget_exceeded",
+                    current_watermark=response_watermark,
+                    token=resumption_token,
+                    error_category=budget_error,
+                    error_message=budget_error.replace("_", " "),
+                )
             decision = limiter.before_request(owner_token=owner_token)
             request_params = build_list_records_params(
-                metadata_prefix=request.metadata_prefix,
-                set_spec=request.set_spec,
+                metadata_prefix=effective_request.metadata_prefix,
+                set_spec=effective_request.set_spec,
                 from_datestamp=from_datestamp,
                 until_datestamp=until_datestamp,
                 resumption_token=resumption_token,
@@ -240,27 +430,99 @@ class HuldraBroker:
                     error_category=decision.blocked_reason,
                     error_message=decision.blocked_reason,
                 )
-                return self.store.complete_oai_harvest_job(
-                    harvest_id=harvest_id,
+                return finish(
                     status=status,
-                    records_processed=records_processed,
-                    papers_upserted=papers_upserted,
-                    deleted_records=deleted_records,
                     pages_total=page_index + 1,
                     current_watermark=response_watermark,
-                    resumption_token=resumption_token,
+                    token=resumption_token,
                     error_category=decision.blocked_reason,
                     error_message=decision.blocked_reason,
                 )
+            if (
+                deadline_at is not None
+                and utc_now() + timedelta(seconds=decision.wait_seconds) >= deadline_at
+            ):
+                self.store.release_lease("upstream_fetch", owner_token)
+                return finish(
+                    status="budget_exceeded",
+                    current_watermark=response_watermark,
+                    token=resumption_token,
+                    error_category="runtime_budget_exceeded",
+                    error_message="runtime budget would expire before the next request",
+                )
             if decision.wait_seconds > 0:
                 time.sleep(decision.wait_seconds)
+            budget_error = _oai_budget_error(
+                effective_request,
+                pages_total=page_index,
+                requests_total=requests_total,
+                deadline_at=deadline_at,
+            )
+            if budget_error is not None:
+                self.store.release_lease("upstream_fetch", owner_token)
+                return finish(
+                    status="budget_exceeded",
+                    current_watermark=response_watermark,
+                    token=resumption_token,
+                    error_category=budget_error,
+                    error_message=budget_error.replace("_", " "),
+                )
+            requests_total = self.store.record_oai_request_started(harvest_id)
+            request_timeout_seconds = self.settings.request_timeout_seconds
+            if deadline_at is not None:
+                remaining_runtime_seconds = (deadline_at - utc_now()).total_seconds()
+                if remaining_runtime_seconds <= 0:
+                    self.store.release_lease("upstream_fetch", owner_token)
+                    return finish(
+                        status="budget_exceeded",
+                        current_watermark=response_watermark,
+                        token=resumption_token,
+                        error_category="runtime_budget_exceeded",
+                        error_message="runtime budget expired before the next request",
+                    )
+                request_timeout_seconds = min(
+                    request_timeout_seconds,
+                    remaining_runtime_seconds,
+                )
+            post_fetch_lease_seconds = max(
+                self.settings.lease_timeout_seconds,
+                ceil(
+                    request_timeout_seconds
+                    + self.store.timeout
+                    + 5.0
+                ),
+            )
+            if not self.store.renew_leases_if_owned(
+                (
+                    (scope_lease_name, scope_owner, scope_lease_seconds),
+                    ("upstream_fetch", owner_token, post_fetch_lease_seconds),
+                )
+            ):
+                self.store.release_lease("upstream_fetch", owner_token)
+                return ownership_lost()
+            if deadline_at is not None:
+                remaining_runtime_seconds = (deadline_at - utc_now()).total_seconds()
+                if remaining_runtime_seconds <= 0:
+                    self.store.release_lease("upstream_fetch", owner_token)
+                    return finish(
+                        status="budget_exceeded",
+                        current_watermark=response_watermark,
+                        token=resumption_token,
+                        error_category="runtime_budget_exceeded",
+                        error_message="runtime budget expired before the next request",
+                    )
+                request_timeout_seconds = min(
+                    request_timeout_seconds,
+                    remaining_runtime_seconds,
+                )
             try:
                 page = fetcher.list_records(
-                    metadata_prefix=request.metadata_prefix,
-                    set_spec=request.set_spec,
+                    metadata_prefix=effective_request.metadata_prefix,
+                    set_spec=effective_request.set_spec,
                     from_datestamp=from_datestamp,
                     until_datestamp=until_datestamp,
                     resumption_token=resumption_token,
+                    timeout_seconds=request_timeout_seconds,
                 )
             except RateLimitedError as exc:
                 cooldown_until = limiter.after_429(
@@ -278,15 +540,11 @@ class HuldraBroker:
                     error_category="rate_limited",
                     error_message=str(exc),
                 )
-                return self.store.complete_oai_harvest_job(
-                    harvest_id=harvest_id,
+                return finish(
                     status="rate_limited",
-                    records_processed=records_processed,
-                    papers_upserted=papers_upserted,
-                    deleted_records=deleted_records,
                     pages_total=page_index + 1,
                     current_watermark=response_watermark,
-                    resumption_token=resumption_token,
+                    token=resumption_token,
                     error_category="rate_limited",
                     error_message=f"{exc}; cooldown_until={cooldown_until.isoformat()}",
                 )
@@ -305,15 +563,11 @@ class HuldraBroker:
                     error_category="transient",
                     error_message=str(exc),
                 )
-                return self.store.complete_oai_harvest_job(
-                    harvest_id=harvest_id,
+                return finish(
                     status="transient_failure",
-                    records_processed=records_processed,
-                    papers_upserted=papers_upserted,
-                    deleted_records=deleted_records,
                     pages_total=page_index + 1,
                     current_watermark=response_watermark,
-                    resumption_token=resumption_token,
+                    token=resumption_token,
                     error_category="transient",
                     error_message=str(exc),
                 )
@@ -332,62 +586,89 @@ class HuldraBroker:
                     error_category="non_retryable",
                     error_message=str(exc),
                 )
-                return self.store.complete_oai_harvest_job(
-                    harvest_id=harvest_id,
+                return finish(
                     status="failed",
-                    records_processed=records_processed,
-                    papers_upserted=papers_upserted,
-                    deleted_records=deleted_records,
                     pages_total=page_index + 1,
                     current_watermark=response_watermark,
-                    resumption_token=resumption_token,
+                    token=resumption_token,
                     error_category="non_retryable",
                     error_message=str(exc),
                 )
-            limiter.after_success(owner_token=owner_token)
-            processed, upserted, deleted = self.store.upsert_oai_records(page.records)
-            records_processed += processed
-            papers_upserted += upserted
-            deleted_records += deleted
-            response_watermark = (
+
+            next_response_watermark = (
                 _normalize_oai_day_datestamp(page.response_date, keep_invalid=False)
                 or response_watermark
             )
-            max_datestamp_seen = _max_datestamp_seen(page.records, max_datestamp_seen)
-            self.store.record_oai_page(
-                harvest_id=harvest_id,
-                page_index=page_index,
-                request_params=page.request_params or request_params,
-                status="completed",
-                response_date=page.response_date,
-                records_count=len(page.records),
-                resumption_token_hash=_hash_token(resumption_token),
+            next_max_datestamp = _max_datestamp_seen(page.records, max_datestamp_seen)
+            next_token = page.resumption_token
+            next_token_hash = _hash_token(next_token)
+            consumed_token_hash = _hash_token(resumption_token)
+            token_error = _oai_token_error(
+                records_total=len(page.records),
+                consumed_token_hash=consumed_token_hash,
+                next_token_hash=next_token_hash,
+                consumed_token_hashes=consumed_token_hashes,
             )
+            try:
+                processed, upserted, deleted = self.store.checkpoint_oai_page(
+                    harvest_id=harvest_id,
+                    page_index=page_index,
+                    request_params=page.request_params or request_params,
+                    records=page.records,
+                    response_date=page.response_date,
+                    consumed_resumption_token=resumption_token,
+                    consumed_resumption_token_hash=consumed_token_hash,
+                    next_resumption_token=next_token,
+                    next_resumption_token_hash=next_token_hash,
+                    last_response_date=next_response_watermark,
+                    last_datestamp_seen=next_max_datestamp,
+                    terminal_error_category=token_error,
+                    terminal_error_message=(
+                        token_error.replace("_", " ") if token_error is not None else None
+                    ),
+                )
+            except Exception as exc:
+                limiter.after_failure(
+                    owner_token=owner_token,
+                    status=None,
+                    error_message=f"OAI checkpoint failed: {exc}",
+                )
+                raise
+            limiter.after_success(owner_token=owner_token)
+            records_processed += processed
+            papers_upserted += upserted
+            deleted_records += deleted
+            response_watermark = next_response_watermark
+            max_datestamp_seen = next_max_datestamp
             page_index += 1
-            if not page.resumption_token:
-                break
-            resumption_token = page.resumption_token
+            if consumed_token_hash is not None:
+                consumed_token_hashes.add(consumed_token_hash)
+            resumption_token = next_token
+            if token_error is not None:
+                return finish(
+                    status="failed",
+                    current_watermark=response_watermark,
+                    token=resumption_token,
+                    error_category=token_error,
+                    error_message=token_error.replace("_", " "),
+                )
+            finished_paging = next_token is None
 
         current_watermark = (
             response_watermark
-            if _should_commit_oai_watermark(request)
+            if _should_commit_oai_watermark(effective_request)
             else max_datestamp_seen
         ) or max_datestamp_seen or from_datestamp
-        if _should_commit_oai_watermark(request):
+        if _should_commit_oai_watermark(effective_request):
             self.store.set_oai_watermark(
-                metadata_prefix=request.metadata_prefix,
-                set_spec=request.set_spec,
+                metadata_prefix=effective_request.metadata_prefix,
+                set_spec=effective_request.set_spec,
                 last_response_date=response_watermark,
                 last_datestamp_seen=max_datestamp_seen,
                 harvest_id=harvest_id,
             )
-        return self.store.complete_oai_harvest_job(
-            harvest_id=harvest_id,
+        return finish(
             status="completed",
-            records_processed=records_processed,
-            papers_upserted=papers_upserted,
-            deleted_records=deleted_records,
-            pages_total=page_index,
             current_watermark=current_watermark,
         )
 
@@ -418,13 +699,72 @@ class HuldraBroker:
         wait: bool = False,
         wait_timeout_seconds: float | None = None,
         mode: LegacySyncMode = LegacySyncMode.SLICE,
+        max_pages_per_window: int = 100,
+        max_requests_total: int = 500,
     ) -> HuldraMaintenanceResult:
         if mode == LegacySyncMode.COMPLETE_WINDOW and not wait:
             raise ValueError("complete_window mode requires wait=True")
-        targets = []
+        if max_pages_per_window <= 0 or max_requests_total <= 0:
+            raise ValueError("maintenance budgets must be positive")
+        if not requests:
+            return HuldraMaintenanceResult()
+        initial_plan: list[tuple[ArxivRequest, str, CacheEntry | None]] = []
         for request in requests:
             cache_key = request_cache_key(request)
-            sync_job_id = self.store.create_sync_job(request, mode)
+            readable = self.store.get_readable_completed_cache(cache_key)
+            if readable is None and self._try_compose_cached_id_list(request, cache_key) is not None:
+                readable = self.store.get_readable_completed_cache(cache_key)
+            initial_plan.append((request, cache_key, readable))
+        initial_requests_total = len(
+            {
+                cache_key
+                for _request, cache_key, cached in initial_plan
+                if cached is None
+            }
+        )
+        if initial_requests_total > max_requests_total:
+            raise ValueError(
+                f"maintenance plan exceeds request budget: "
+                f"required={initial_requests_total}, limit={max_requests_total}"
+            )
+        timeout = _maintenance_timeout_seconds(requests, self.settings, wait_timeout_seconds)
+        deadline = time.monotonic() + timeout
+        deadline_at = utc_now() + timedelta(seconds=timeout)
+        if (
+            mode == LegacySyncMode.COMPLETE_WINDOW
+            and initial_requests_total > 0
+            and not _deadline_can_fit_requests(
+                deadline,
+                initial_requests_total,
+                self.settings.request_interval_seconds,
+                initial_wait_seconds=HuldraRateLimiter(
+                    self.store,
+                    self.settings,
+                ).seconds_until_next_request(),
+            )
+        ):
+            raise ValueError("maintenance plan exceeds runtime deadline budget")
+        upstream_budget_id = self.store.create_upstream_request_budget(
+            max_requests=max_requests_total,
+            deadline_at=(deadline_at if mode == LegacySyncMode.COMPLETE_WINDOW else None),
+        )
+        budget = _MaintenanceBudget(
+            upstream_budget_id=upstream_budget_id,
+            max_pages_per_window=max_pages_per_window,
+            max_requests_total=max_requests_total,
+            deadline=deadline,
+            deadline_at=deadline_at,
+            reserved_requests=initial_requests_total,
+        )
+        targets = []
+        initial_cache: dict[str, CacheEntry | None] = {}
+        for request, cache_key, readable in initial_plan:
+            initial_cache[cache_key] = readable
+            sync_job_id = self.store.create_sync_job(
+                request,
+                mode,
+                upstream_budget_id=budget.upstream_budget_id,
+            )
             self.store.record_sync_job_page(
                 sync_job_id=sync_job_id,
                 request=request,
@@ -441,7 +781,7 @@ class HuldraBroker:
             )
         result = HuldraMaintenanceResult(requested_total=len(targets))
         for target in targets:
-            readable = self.store.get_readable_completed_cache(target.cache_key)
+            readable = initial_cache[target.cache_key]
             if readable is not None:
                 target.initial_cache_hit = True
                 self.store.refresh_sync_job_page_from_cache(
@@ -452,11 +792,28 @@ class HuldraBroker:
                 result.cache_hit_total += 1
                 continue
             result.cache_miss_total += 1
+            if (
+                mode == LegacySyncMode.COMPLETE_WINDOW
+                and time.monotonic() >= budget.deadline
+            ):
+                self.store.fail_active_upstream_budget_items(
+                    budget.upstream_budget_id,
+                    error_category="deadline_budget_exceeded",
+                    error_message="maintenance deadline expired before initial enqueue",
+                )
+                self._complete_initial_maintenance_budget_failure(
+                    target,
+                    error_category="deadline_budget_exceeded",
+                    error_message="maintenance deadline expired before initial enqueue",
+                )
+                continue
             queue_request = target.request.model_copy(update={"cache_policy": CachePolicy.CACHE_OR_ENQUEUE})
             item, joined = self.store.enqueue_request_for_work(
                 queue_request,
                 target.cache_key,
                 work_kind=QueueWorkKind.FETCH_MISSING,
+                upstream_budget_id=budget.upstream_budget_id,
+                default_timeout_seconds=self.settings.request_timeout_seconds,
             )
             target.request_id = item.request_id
             target.joined_existing_queue = joined
@@ -471,7 +828,12 @@ class HuldraBroker:
 
         if wait and targets:
             if mode == LegacySyncMode.COMPLETE_WINDOW:
-                result = self._drain_complete_window_targets(targets, result, wait_timeout_seconds)
+                result = self._drain_complete_window_targets(
+                    targets,
+                    result,
+                    budget,
+                    timeout,
+                )
             else:
                 result = result.model_copy(
                     update=self._drain_maintenance_targets(
@@ -499,6 +861,8 @@ class HuldraBroker:
         wait_timeout_seconds: float | None = None,
         mode: LegacySyncMode = LegacySyncMode.SLICE,
         client_id: str = "huldra-backfill",
+        max_pages_per_window: int = 100,
+        max_requests_total: int = 500,
     ) -> HuldraMaintenanceResult:
         from huldra.planner import build_submitted_date_windows
 
@@ -513,6 +877,8 @@ class HuldraBroker:
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
             mode=mode,
+            max_pages_per_window=max_pages_per_window,
+            max_requests_total=max_requests_total,
         )
 
     def _wait_until_ready(
@@ -600,6 +966,7 @@ class HuldraBroker:
             error_category=entry.error_category,
             error_message=entry.error_message,
             completed_at=entry.completed_at,
+            refresh_after=entry.refresh_after,
             cooldown_until=entry.cooldown_until,
             upstream_status=entry.upstream_status,
         )
@@ -697,17 +1064,23 @@ class HuldraBroker:
         self,
         targets: list[_MaintenanceTarget],
         result: HuldraMaintenanceResult,
-        wait_timeout_seconds: float | None,
+        budget: _MaintenanceBudget,
+        timeout: float,
     ) -> HuldraMaintenanceResult:
-        timeout = _maintenance_timeout_seconds(
-            [target.request for target in targets],
-            self.settings,
-            wait_timeout_seconds,
+        result = self._drain_targets_until_deadline(
+            targets,
+            result,
+            budget.deadline,
+            timeout,
+            upstream_budget_id=budget.upstream_budget_id,
         )
-        deadline = time.monotonic() + timeout
-        result = self._drain_targets_until_deadline(targets, result, deadline, timeout)
         for target in targets:
-            result = self._plan_and_drain_complete_window_target(target, result, deadline, timeout)
+            result = self._plan_and_drain_complete_window_target(
+                target,
+                result,
+                budget,
+                timeout,
+            )
         return result
 
     def _drain_targets_until_deadline(
@@ -716,6 +1089,8 @@ class HuldraBroker:
         result: HuldraMaintenanceResult,
         deadline: float,
         timeout: float,
+        *,
+        upstream_budget_id: str | None = None,
     ) -> HuldraMaintenanceResult:
         if not targets:
             return result
@@ -731,17 +1106,43 @@ class HuldraBroker:
             result = _count_inline_worker_result(result, worker_result)
             if worker_result.status == "idle":
                 time.sleep(min(0.05, max(0.01, timeout / 50)))
+        if upstream_budget_id is not None and time.monotonic() >= deadline:
+            expired_targets = [
+                target for target in targets if not self._target_terminal(target)
+            ]
+            error_category = "deadline_budget_exceeded"
+            error_message = "maintenance deadline expired before upstream fetch"
+            self.store.fail_active_upstream_budget_items(
+                upstream_budget_id,
+                error_category=error_category,
+                error_message=error_message,
+            )
+            for target in expired_targets:
+                target.aggregate_raw_status = "partial"
+                target.aggregate_error_category = error_category
+                target.aggregate_error_message = error_message
         return result
 
     def _plan_and_drain_complete_window_target(
         self,
         target: _MaintenanceTarget,
         result: HuldraMaintenanceResult,
-        deadline: float,
+        budget: _MaintenanceBudget,
         timeout: float,
     ) -> HuldraMaintenanceResult:
         sync_job_id = target.sync_job_id
         assert sync_job_id is not None
+        if target.aggregate_error_category == "deadline_budget_exceeded":
+            if target.coverage_status == CoverageStatus.UNKNOWN:
+                self._complete_initial_maintenance_budget_failure(
+                    target,
+                    error_category=target.aggregate_error_category,
+                    error_message=(
+                        target.aggregate_error_message
+                        or "maintenance deadline expired before upstream fetch"
+                    ),
+                )
+            return result
         first = self.store.get_readable_completed_cache(target.cache_key)
         self.store.refresh_sync_job_page_from_cache(
             sync_job_id=sync_job_id,
@@ -750,10 +1151,27 @@ class HuldraBroker:
         )
         if first is None:
             entry = self.store.get_cache_entry(target.cache_key)
+            queue_item = (
+                self.store.get_queue_item(target.request_id)
+                if target.request_id is not None
+                else None
+            )
             target.coverage_status = CoverageStatus.PARTIAL
-            target.aggregate_raw_status = entry.status if entry is not None else "partial"
-            target.aggregate_error_category = entry.error_category if entry is not None else None
-            target.aggregate_error_message = entry.error_message if entry is not None else None
+            target.aggregate_raw_status = (
+                entry.status
+                if entry is not None
+                else (str(queue_item.status) if queue_item is not None else "partial")
+            )
+            target.aggregate_error_category = (
+                entry.error_category
+                if entry is not None
+                else (queue_item.error_category if queue_item is not None else None)
+            )
+            target.aggregate_error_message = (
+                entry.error_message
+                if entry is not None
+                else (queue_item.error_message if queue_item is not None else None)
+            )
             target.pages_total = 1
             target.pages_completed_total = 0
             self.store.complete_sync_job(
@@ -833,8 +1251,25 @@ class HuldraBroker:
             )
             return result
 
-        page_targets = [target]
         next_start = target.request.start + first.result_count
+        remaining_results = max(0, first.total_results - next_start)
+        followup_pages_total = (
+            (remaining_results + target.request.max_results - 1) // target.request.max_results
+        )
+        required_pages_total = 1 + followup_pages_total
+        if required_pages_total > budget.max_pages_per_window:
+            self._complete_window_budget_failure(
+                target,
+                first,
+                error_category="page_budget_exceeded",
+                error_message=(
+                    f"complete window requires {required_pages_total} pages; "
+                    f"limit is {budget.max_pages_per_window}"
+                ),
+            )
+            return result
+
+        planned_pages: list[tuple[ArxivRequest, str, CacheEntry | None]] = []
         while next_start < first.total_results:
             page_request = target.request.model_copy(
                 update={
@@ -843,6 +1278,65 @@ class HuldraBroker:
                 }
             )
             page_key = request_cache_key(page_request)
+            planned_pages.append(
+                (
+                    page_request,
+                    page_key,
+                    self.store.get_readable_completed_cache(page_key),
+                )
+            )
+            next_start += target.request.max_results
+
+        missing_pages_total = sum(1 for _request, _key, cached in planned_pages if cached is None)
+        requests_started = self.store.get_upstream_request_budget_requests_started(
+            budget.upstream_budget_id
+        )
+        if requests_started is None:
+            self._complete_window_budget_failure(
+                target,
+                first,
+                error_category="request_budget_exceeded",
+                error_message="upstream request budget no longer exists",
+            )
+            return result
+        # Admission reserves unique cache misses optimistically. Reconcile that
+        # estimate after each drain because another process may have filled a
+        # missing page without consuming this maintenance budget.
+        budget.reserved_requests = requests_started
+        if budget.reserved_requests + missing_pages_total > budget.max_requests_total:
+            self._complete_window_budget_failure(
+                target,
+                first,
+                error_category="request_budget_exceeded",
+                error_message=(
+                    f"complete window would reserve {missing_pages_total} additional requests; "
+                    f"{budget.reserved_requests} of {budget.max_requests_total} already used"
+                ),
+            )
+            return result
+        if missing_pages_total and not _deadline_can_fit_requests(
+            budget.deadline,
+            missing_pages_total,
+            self.settings.request_interval_seconds,
+            initial_wait_seconds=HuldraRateLimiter(
+                self.store,
+                self.settings,
+            ).seconds_until_next_request(),
+        ):
+            self._complete_window_budget_failure(
+                target,
+                first,
+                error_category="deadline_budget_exceeded",
+                error_message="complete window cannot finish before the maintenance deadline",
+            )
+            return result
+        budget.reserved_requests += missing_pages_total
+
+        page_targets = [target]
+        for page_request, page_key, cached in planned_pages:
+            if cached is None and time.monotonic() >= budget.deadline:
+                self._complete_followup_deadline_budget_failure(target, first, budget)
+                return result
             page_target = _MaintenanceTarget(
                 request=page_request,
                 cache_key=page_key,
@@ -855,24 +1349,119 @@ class HuldraBroker:
                 cache_key=page_key,
                 status="planned",
             )
-            if self.store.get_readable_completed_cache(page_key) is None:
+            if cached is None:
+                if time.monotonic() >= budget.deadline:
+                    self._complete_followup_deadline_budget_failure(target, first, budget)
+                    return result
                 item, joined = self.store.enqueue_request_for_work(
                     page_request,
                     page_key,
                     work_kind=QueueWorkKind.FETCH_MISSING,
+                    upstream_budget_id=budget.upstream_budget_id,
+                    default_timeout_seconds=self.settings.request_timeout_seconds,
                 )
                 page_target.request_id = item.request_id
                 page_target.joined_existing_queue = joined
                 if not joined:
                     result = result.model_copy(update={"queued_total": result.queued_total + 1})
+                if time.monotonic() >= budget.deadline:
+                    self._complete_followup_deadline_budget_failure(target, first, budget)
+                    return result
             else:
                 page_target.initial_cache_hit = True
             page_targets.append(page_target)
-            next_start += target.request.max_results
 
-        result = self._drain_targets_until_deadline(page_targets[1:], result, deadline, timeout)
+        result = self._drain_targets_until_deadline(
+            page_targets[1:],
+            result,
+            budget.deadline,
+            timeout,
+            upstream_budget_id=budget.upstream_budget_id,
+        )
         self._finalize_complete_window_target(target, page_targets)
         return result
+
+    def _complete_followup_deadline_budget_failure(
+        self,
+        target: _MaintenanceTarget,
+        first: CacheEntry,
+        budget: _MaintenanceBudget,
+    ) -> None:
+        sync_job_id = target.sync_job_id
+        assert sync_job_id is not None
+        error_message = "maintenance deadline expired before follow-up enqueue"
+        self.store.fail_active_upstream_budget_items(
+            budget.upstream_budget_id,
+            error_category="deadline_budget_exceeded",
+            error_message=error_message,
+        )
+        self.store.delete_sync_job_followup_pages(
+            sync_job_id=sync_job_id,
+            initial_cache_key=target.cache_key,
+        )
+        self._complete_window_budget_failure(
+            target,
+            first,
+            error_category="deadline_budget_exceeded",
+            error_message=error_message,
+        )
+
+    def _complete_initial_maintenance_budget_failure(
+        self,
+        target: _MaintenanceTarget,
+        *,
+        error_category: str,
+        error_message: str,
+    ) -> None:
+        sync_job_id = target.sync_job_id
+        assert sync_job_id is not None
+        target.coverage_status = CoverageStatus.PARTIAL
+        target.pages_total = 1
+        target.pages_completed_total = 0
+        target.aggregate_raw_status = "partial"
+        target.aggregate_error_category = error_category
+        target.aggregate_error_message = error_message
+        self.store.complete_sync_job(
+            sync_job_id=sync_job_id,
+            status="partial",
+            coverage_status=CoverageStatus.PARTIAL,
+            result_count=0,
+            total_results=None,
+            pages_total=1,
+            pages_completed_total=0,
+            error_category=error_category,
+            error_message=error_message,
+        )
+
+    def _complete_window_budget_failure(
+        self,
+        target: _MaintenanceTarget,
+        first: CacheEntry,
+        *,
+        error_category: str,
+        error_message: str,
+    ) -> None:
+        sync_job_id = target.sync_job_id
+        assert sync_job_id is not None
+        target.coverage_status = CoverageStatus.PARTIAL
+        target.result_count = first.result_count
+        target.total_results = first.total_results
+        target.pages_total = 1
+        target.pages_completed_total = 1
+        target.aggregate_raw_status = "partial"
+        target.aggregate_error_category = error_category
+        target.aggregate_error_message = error_message
+        self.store.complete_sync_job(
+            sync_job_id=sync_job_id,
+            status="partial",
+            coverage_status=CoverageStatus.PARTIAL,
+            result_count=first.result_count,
+            total_results=first.total_results,
+            pages_total=1,
+            pages_completed_total=1,
+            error_category=error_category,
+            error_message=error_message,
+        )
 
     def _finalize_complete_window_target(
         self,
@@ -882,8 +1471,10 @@ class HuldraBroker:
         sync_job_id = target.sync_job_id
         assert sync_job_id is not None
         result_count = 0
+        page_results_total = 0
         total_results = target.total_results
         pages_completed = 0
+        unique_paper_ids: set[str] = set()
         first_error_category = None
         first_error_message = None
         for page_target in page_targets:
@@ -894,17 +1485,34 @@ class HuldraBroker:
             )
             readable = self.store.get_readable_completed_cache(page_target.cache_key)
             if readable is not None:
-                result_count += readable.result_count
+                page_results_total += readable.result_count
+                unique_paper_ids.update(
+                    arxiv_id_family_base(paper.arxiv_id)
+                    for paper in self.store.get_cached_papers(page_target.cache_key)
+                )
                 total_results = readable.total_results if total_results is None else total_results
                 pages_completed += 1
             elif first_error_category is None:
-                first_error_category = page.get("error_category")
+                first_error_category = (
+                    page_target.aggregate_error_category or page.get("error_category")
+                )
                 entry = self.store.get_cache_entry(page_target.cache_key)
-                first_error_message = entry.error_message if entry is not None else None
+                first_error_message = page_target.aggregate_error_message or (
+                    entry.error_message if entry is not None else None
+                )
         pages_total = len(page_targets)
+        result_count = len(unique_paper_ids)
+        overlapping_results_total = page_results_total - result_count
+        if overlapping_results_total > 0 and first_error_category is None:
+            first_error_category = "overlapping_page_results"
+            first_error_message = (
+                "legacy search pages contained "
+                f"{overlapping_results_total} duplicate or overlapping paper results"
+            )
         complete = (
             total_results is not None
             and pages_completed == pages_total
+            and overlapping_results_total == 0
             and result_count >= max(0, total_results - target.request.start)
         )
         target.coverage_status = CoverageStatus.COMPLETE if complete else CoverageStatus.PARTIAL
@@ -957,6 +1565,7 @@ class HuldraBroker:
         skipped_total = 0
         rate_limited_total = 0
         failed_total = 0
+        budget_exhausted_total = 0
         cooldown_until = None
         for target in targets:
             readable = self.store.get_readable_completed_cache(target.cache_key)
@@ -1038,14 +1647,20 @@ class HuldraBroker:
             request_cooldown_until = cache_entry.cooldown_until if cache_entry is not None else None
             request_error_category = cache_entry.error_category if cache_entry is not None else None
             request_error_message = cache_entry.error_message if cache_entry is not None else None
-            if target.aggregate_error_category is not None:
-                request_error_category = target.aggregate_error_category
-            if target.aggregate_error_message is not None:
-                request_error_message = target.aggregate_error_message
             if queue_item is not None and (cache_entry is None or cache_entry.status == "completed"):
                 request_cooldown_until = queue_item.next_attempt_at or request_cooldown_until
                 request_error_category = queue_item.error_category or request_error_category
                 request_error_message = queue_item.error_message or request_error_message
+            if target.aggregate_error_category is not None:
+                request_error_category = target.aggregate_error_category
+            if target.aggregate_error_message is not None:
+                request_error_message = target.aggregate_error_message
+            if request_error_category in {
+                "page_budget_exceeded",
+                "request_budget_exceeded",
+                "deadline_budget_exceeded",
+            }:
+                budget_exhausted_total += 1
             if (
                 target.sync_job_id is not None
                 and mode == LegacySyncMode.SLICE
@@ -1104,6 +1719,7 @@ class HuldraBroker:
                 "skipped_windows_total": skipped_total,
                 "rate_limited_windows_total": rate_limited_total,
                 "failed_windows_total": failed_total,
+                "budget_exhausted_windows_total": budget_exhausted_total,
                 "cooldown_active": cooldown_active_total > 0,
                 "cooldown_until": cooldown_until,
                 "requests": entries,
@@ -1190,6 +1806,59 @@ def _hash_token(value: str | None) -> str | None:
     return sha256(value.encode()).hexdigest()
 
 
+def _oai_scope_lease_name(request: OaiHarvestRequest) -> str:
+    if _should_commit_oai_watermark(request):
+        scope_parts = (
+            request.metadata_prefix,
+            request.set_spec or "",
+            "shared-watermark-writer",
+        )
+    else:
+        scope_parts = (
+            request.metadata_prefix,
+            request.set_spec or "",
+            request.from_datestamp or "",
+            request.until_datestamp or "",
+            str(request.mode),
+        )
+    scope = "\0".join(scope_parts)
+    return f"oai_harvest:{sha256(scope.encode()).hexdigest()}"
+
+
+def _oai_budget_error(
+    request: OaiHarvestRequest,
+    *,
+    pages_total: int,
+    requests_total: int,
+    deadline_at: datetime | None,
+) -> str | None:
+    if pages_total >= request.max_pages:
+        return "page_budget_exceeded"
+    if requests_total >= request.max_requests:
+        return "request_budget_exceeded"
+    if deadline_at is not None and utc_now() >= deadline_at:
+        return "runtime_budget_exceeded"
+    return None
+
+
+def _oai_token_error(
+    *,
+    records_total: int,
+    consumed_token_hash: str | None,
+    next_token_hash: str | None,
+    consumed_token_hashes: set[str],
+) -> str | None:
+    if next_token_hash is None:
+        return None
+    if consumed_token_hash is not None and next_token_hash == consumed_token_hash:
+        return "repeated_resumption_token"
+    if next_token_hash in consumed_token_hashes:
+        return "resumption_token_cycle"
+    if records_total == 0:
+        return "no_progress"
+    return None
+
+
 def _max_datestamp_seen(records: Sequence[OaiRecord], current: str | None) -> str | None:
     best = current
     for record in records:
@@ -1269,6 +1938,19 @@ def _maintenance_timeout_seconds(
     if request_timeouts:
         return max(request_timeouts)
     return settings.request_timeout_seconds
+
+
+def _deadline_can_fit_requests(
+    deadline: float,
+    requests_total: int,
+    interval_seconds: float,
+    *,
+    initial_wait_seconds: float,
+) -> bool:
+    minimum_seconds = max(0.0, initial_wait_seconds) + (
+        max(0, requests_total - 1) * interval_seconds
+    )
+    return time.monotonic() + minimum_seconds <= deadline
 
 
 def _count_inline_worker_result(

@@ -112,6 +112,8 @@ class HuldraClient:
         wait: bool = False,
         wait_timeout_seconds: float | None = None,
         mode: LegacySyncMode = LegacySyncMode.SLICE,
+        max_pages_per_window: int = 100,
+        max_requests_total: int = 500,
     ) -> HuldraMaintenanceResult:
         response = self._client.post(
             "/v1/sync",
@@ -120,6 +122,8 @@ class HuldraClient:
                 "wait": wait,
                 "wait_timeout_seconds": wait_timeout_seconds,
                 "mode": mode,
+                "max_pages_per_window": max_pages_per_window,
+                "max_requests_total": max_requests_total,
             },
         )
         return HuldraMaintenanceResult.model_validate(self._json(response))
@@ -135,6 +139,8 @@ class HuldraClient:
         wait_timeout_seconds: float | None = None,
         mode: LegacySyncMode = LegacySyncMode.SLICE,
         client_id: str = "huldra-backfill",
+        max_pages_per_window: int = 100,
+        max_requests_total: int = 500,
     ) -> HuldraMaintenanceResult:
         response = self._client.post(
             "/v1/backfill",
@@ -147,6 +153,8 @@ class HuldraClient:
                 "wait_timeout_seconds": wait_timeout_seconds,
                 "mode": mode,
                 "client_id": client_id,
+                "max_pages_per_window": max_pages_per_window,
+                "max_requests_total": max_requests_total,
             },
         )
         return HuldraMaintenanceResult.model_validate(self._json(response))

@@ -33,6 +33,13 @@ def test_id_order_is_part_of_cache_key() -> None:
     assert request_cache_key(r1) != request_cache_key(r2)
 
 
+def test_refresh_interval_is_not_part_of_cache_key() -> None:
+    base = ArxivRequest(client_id="a", search_query="cat:cs.AI")
+    frequent = base.model_copy(update={"refresh_interval_seconds": 60})
+
+    assert request_cache_key(base) == request_cache_key(frequent)
+
+
 def test_build_params_adds_submitted_date_filter() -> None:
     request = ArxivRequest(
         client_id="a",
