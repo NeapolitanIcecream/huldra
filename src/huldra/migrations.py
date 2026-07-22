@@ -80,6 +80,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             work_kind TEXT NOT NULL DEFAULT 'fetch_missing',
             upstream_budget_id TEXT,
             upstream_budget_gate_closed INTEGER NOT NULL DEFAULT 0,
+            unbudgeted_demand INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             claimed_by TEXT,
@@ -278,6 +279,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         "upstream_budget_gate_closed",
         "INTEGER NOT NULL DEFAULT 0",
     )
+    _ensure_queue_items_unbudgeted_demand(conn)
     _ensure_column(conn, "sync_jobs", "upstream_budget_id", "TEXT")
     _ensure_column(
         conn,
@@ -412,6 +414,25 @@ def _ensure_queue_items_work_kind(conn: sqlite3.Connection) -> None:
         return
     conn.execute(
         "ALTER TABLE queue_items ADD COLUMN work_kind TEXT NOT NULL DEFAULT 'fetch_missing'"
+    )
+
+
+def _ensure_queue_items_unbudgeted_demand(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(queue_items)").fetchall()
+    }
+    if "unbudgeted_demand" in columns:
+        return
+    conn.execute(
+        "ALTER TABLE queue_items "
+        "ADD COLUMN unbudgeted_demand INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute(
+        """
+        UPDATE queue_items
+        SET unbudgeted_demand=1
+        WHERE upstream_budget_id IS NULL
+        """
     )
 
 

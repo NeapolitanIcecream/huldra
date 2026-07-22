@@ -91,6 +91,36 @@ def test_complete_window_sync_fetches_all_contiguous_pages(
     assert [seen.start for seen in fetcher.seen] == [0, 1, 2]
 
 
+def test_complete_window_caps_atom_request_to_remaining_runtime(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(broker_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(broker_module, "utc_now", lambda: started)
+    monkeypatch.setattr(db_module, "utc_now", lambda: started)
+    monkeypatch.setattr(limiter_module, "utc_now", lambda: started)
+    monkeypatch.setattr(worker_module, "utc_now", lambda: started)
+    tuned = settings.model_copy(update={"request_timeout_seconds": 30.0})
+    fetcher = CapturingFetcher(
+        [FetchResult([make_paper("2401.00001v1")], total_results=1)],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=tuned, fetcher=fetcher).sync_windows(
+        [ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)],
+        wait=True,
+        wait_timeout_seconds=4,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    assert result.completed_windows_total == 1
+    assert fetcher.seen[0].timeout_seconds == 4.0
+
+
 def test_complete_window_sync_requires_wait_true(
     store: HuldraStore,
     settings: HuldraSettings,

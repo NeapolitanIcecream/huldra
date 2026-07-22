@@ -199,35 +199,10 @@ class HuldraWorker:
             budget_error = self.store.check_queue_item_upstream_request_deadlines(
                 item.request_id
             )
+        if budget_error == "budget_deferred":
+            return self._defer_budgeted_item(item, id_plan)
         if budget_error is not None:
-            self.store.release_lease(self.limiter.lease_name, self.owner_token)
-            error_message = budget_error.replace("_", " ")
-            self.store.record_cache_failure(
-                cache_key=item.cache_key,
-                request=item.request,
-                error_category=budget_error,
-                error_message=error_message,
-                upstream_request_count=0,
-            )
-            self.store.release_or_delay_queue_item(
-                item.request_id,
-                status=RequestStatus.FAILED,
-                error_category=budget_error,
-                error_message=error_message,
-            )
-            self._release_id_plan(id_plan)
-            self.store.record_worker_completed(
-                name=self.name,
-                error_category=budget_error,
-                error_message=error_message,
-            )
-            return WorkerPassResult(
-                status="budget_exceeded",
-                request_id=item.request_id,
-                cache_key=item.cache_key,
-                error_category=budget_error,
-                error_message=error_message,
-            )
+            return self._fail_budgeted_item(item, id_plan, budget_error)
         # Durable budget accounting may itself wait on SQLite long enough for
         # every earlier TTL to expire. Conservatively consumed budget remains
         # consumed if this final ownership fence decides not to issue I/O.
@@ -238,11 +213,46 @@ class HuldraWorker:
         )
         if ownership_result is not None:
             return ownership_result
+        budget_error = self.store.check_queue_item_upstream_request_deadlines(
+            item.request_id
+        )
+        if budget_error == "budget_deferred":
+            return self._defer_budgeted_item(item, id_plan)
+        if budget_error is not None:
+            return self._fail_budgeted_item(item, id_plan, budget_error)
         fetch_request = (
             id_plan.fetch_request
             if id_plan is not None and id_plan.fetch_request is not None
             else item.request
         )
+        budget_deadline = self.store.queue_item_upstream_deadline(item.request_id)
+        if budget_deadline is not None:
+            remaining_budget_seconds = (budget_deadline - utc_now()).total_seconds()
+            if remaining_budget_seconds <= 0:
+                budget_error = self.store.check_queue_item_upstream_request_deadlines(
+                    item.request_id
+                )
+                if budget_error == "budget_deferred":
+                    return self._defer_budgeted_item(item, id_plan)
+                if budget_error is not None:
+                    return self._fail_budgeted_item(item, id_plan, budget_error)
+                budget_deadline = self.store.queue_item_upstream_deadline(
+                    item.request_id
+                )
+                remaining_budget_seconds = (
+                    (budget_deadline - utc_now()).total_seconds()
+                    if budget_deadline is not None
+                    else self.settings.request_timeout_seconds
+                )
+            fetch_request = fetch_request.model_copy(
+                update={
+                    "timeout_seconds": min(
+                        fetch_request.timeout_seconds
+                        or self.settings.request_timeout_seconds,
+                        remaining_budget_seconds,
+                    )
+                }
+            )
         try:
             result = self.fetcher.fetch(fetch_request)
         except RateLimitedError as exc:
@@ -432,6 +442,72 @@ class HuldraWorker:
             self.settings.queue_claim_timeout_seconds,
             self.settings.lease_timeout_seconds,
             ceil(request_timeout + self.store.timeout + 5.0),
+        )
+
+    def _defer_budgeted_item(
+        self,
+        item: QueueItem,
+        id_plan: _IdListFetchPlan | None,
+    ) -> WorkerPassResult:
+        self.store.release_lease(self.limiter.lease_name, self.owner_token)
+        next_attempt = utc_now()
+        error_category = "budget_deferred"
+        error_message = "upstream budget applies to the next queue attempt"
+        self.store.release_or_delay_queue_item(
+            item.request_id,
+            next_attempt_at=next_attempt,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        self._release_id_plan(id_plan)
+        self.store.record_worker_completed(
+            name=self.name,
+            next_wake_at=next_attempt,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        return WorkerPassResult(
+            status="blocked",
+            request_id=item.request_id,
+            cache_key=item.cache_key,
+            cooldown_until=next_attempt,
+            error_category=error_category,
+            error_message=error_message,
+        )
+
+    def _fail_budgeted_item(
+        self,
+        item: QueueItem,
+        id_plan: _IdListFetchPlan | None,
+        error_category: str,
+    ) -> WorkerPassResult:
+        self.store.release_lease(self.limiter.lease_name, self.owner_token)
+        error_message = error_category.replace("_", " ")
+        self.store.record_cache_failure(
+            cache_key=item.cache_key,
+            request=item.request,
+            error_category=error_category,
+            error_message=error_message,
+            upstream_request_count=0,
+        )
+        self.store.release_or_delay_queue_item(
+            item.request_id,
+            status=RequestStatus.FAILED,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        self._release_id_plan(id_plan)
+        self.store.record_worker_completed(
+            name=self.name,
+            error_category=error_category,
+            error_message=error_message,
+        )
+        return WorkerPassResult(
+            status="budget_exceeded",
+            request_id=item.request_id,
+            cache_key=item.cache_key,
+            error_category=error_category,
+            error_message=error_message,
         )
 
     def _gate_fetch_ownership(

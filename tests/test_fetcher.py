@@ -56,6 +56,29 @@ def test_fetcher_turns_200_atom_into_papers(settings: HuldraSettings) -> None:
     assert calls[0].headers["user-agent"] == settings.user_agent
 
 
+def test_fetcher_applies_request_timeout_to_http_call(
+    settings: HuldraSettings,
+) -> None:
+    observed_timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, text=FEED)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    ArxivApiFetcher(settings, client=client).fetch(
+        ArxivRequest(
+            client_id="demo",
+            search_query="cat:cs.AI",
+            timeout_seconds=0.05,
+        )
+    )
+
+    assert len(observed_timeouts) == 1
+    assert set(observed_timeouts[0].values()) == {0.05}
+
+
 def test_fetcher_rejects_200_atom_error_feed(settings: HuldraSettings) -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, text=ERROR_FEED))

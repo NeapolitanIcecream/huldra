@@ -47,6 +47,7 @@ class OaiFetcher(Protocol):
         from_datestamp: str | None = None,
         until_datestamp: str | None = None,
         resumption_token: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> OaiPmhPage: ...
 
 
@@ -68,7 +69,16 @@ class OaiPmhFetcher:
         from_datestamp: str | None = None,
         until_datestamp: str | None = None,
         resumption_token: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> OaiPmhPage:
+        effective_timeout_seconds = self.settings.request_timeout_seconds
+        if timeout_seconds is not None:
+            if timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be positive")
+            effective_timeout_seconds = min(
+                effective_timeout_seconds,
+                timeout_seconds,
+            )
         params = build_list_records_params(
             metadata_prefix=metadata_prefix,
             set_spec=set_spec,
@@ -78,10 +88,20 @@ class OaiPmhFetcher:
         )
         headers = {"User-Agent": self.settings.user_agent}
         if self._client is None:
-            with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
-                response = self._get_once(client, params, headers)
+            with httpx.Client(timeout=effective_timeout_seconds) as client:
+                response = self._get_once(
+                    client,
+                    params,
+                    headers,
+                    timeout_seconds=effective_timeout_seconds,
+                )
         else:
-            response = self._get_once(self._client, params, headers)
+            response = self._get_once(
+                self._client,
+                params,
+                headers,
+                timeout_seconds=effective_timeout_seconds,
+            )
 
         retry_after = response.headers.get("Retry-After")
         if response.status_code == 429:
@@ -140,9 +160,16 @@ class OaiPmhFetcher:
         client: httpx.Client,
         params: dict[str, str],
         headers: dict[str, str],
+        *,
+        timeout_seconds: float,
     ) -> httpx.Response:
         try:
-            return client.get(self.settings.arxiv_oai_pmh_url, params=params, headers=headers)
+            return client.get(
+                self.settings.arxiv_oai_pmh_url,
+                params=params,
+                headers=headers,
+                timeout=timeout_seconds,
+            )
         except httpx.RequestError as exc:
             raise TransientFetchError(f"arXiv OAI-PMH request failed: {exc}") from exc
 

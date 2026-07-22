@@ -466,19 +466,26 @@ class HuldraBroker:
                     error_message=budget_error.replace("_", " "),
                 )
             requests_total = self.store.record_oai_request_started(harvest_id)
-            if deadline_at is not None and utc_now() >= deadline_at:
-                self.store.release_lease("upstream_fetch", owner_token)
-                return finish(
-                    status="budget_exceeded",
-                    current_watermark=response_watermark,
-                    token=resumption_token,
-                    error_category="runtime_budget_exceeded",
-                    error_message="runtime budget expired before the next request",
+            request_timeout_seconds = self.settings.request_timeout_seconds
+            if deadline_at is not None:
+                remaining_runtime_seconds = (deadline_at - utc_now()).total_seconds()
+                if remaining_runtime_seconds <= 0:
+                    self.store.release_lease("upstream_fetch", owner_token)
+                    return finish(
+                        status="budget_exceeded",
+                        current_watermark=response_watermark,
+                        token=resumption_token,
+                        error_category="runtime_budget_exceeded",
+                        error_message="runtime budget expired before the next request",
+                    )
+                request_timeout_seconds = min(
+                    request_timeout_seconds,
+                    remaining_runtime_seconds,
                 )
             post_fetch_lease_seconds = max(
                 self.settings.lease_timeout_seconds,
                 ceil(
-                    self.settings.request_timeout_seconds
+                    request_timeout_seconds
                     + self.store.timeout
                     + 5.0
                 ),
@@ -491,6 +498,21 @@ class HuldraBroker:
             ):
                 self.store.release_lease("upstream_fetch", owner_token)
                 return ownership_lost()
+            if deadline_at is not None:
+                remaining_runtime_seconds = (deadline_at - utc_now()).total_seconds()
+                if remaining_runtime_seconds <= 0:
+                    self.store.release_lease("upstream_fetch", owner_token)
+                    return finish(
+                        status="budget_exceeded",
+                        current_watermark=response_watermark,
+                        token=resumption_token,
+                        error_category="runtime_budget_exceeded",
+                        error_message="runtime budget expired before the next request",
+                    )
+                request_timeout_seconds = min(
+                    request_timeout_seconds,
+                    remaining_runtime_seconds,
+                )
             try:
                 page = fetcher.list_records(
                     metadata_prefix=effective_request.metadata_prefix,
@@ -498,6 +520,7 @@ class HuldraBroker:
                     from_datestamp=from_datestamp,
                     until_datestamp=until_datestamp,
                     resumption_token=resumption_token,
+                    timeout_seconds=request_timeout_seconds,
                 )
             except RateLimitedError as exc:
                 cooldown_until = limiter.after_429(

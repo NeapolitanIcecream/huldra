@@ -69,11 +69,22 @@ class ArxivApiFetcher:
     def fetch(self, request: ArxivRequest) -> FetchResult:
         params = build_arxiv_api_params(request)
         headers = {"User-Agent": self.settings.user_agent}
+        timeout_seconds = request.timeout_seconds or self.settings.request_timeout_seconds
         if self._client is None:
-            with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
-                response = self._get_once(client, params, headers)
+            with httpx.Client(timeout=timeout_seconds) as client:
+                response = self._get_once(
+                    client,
+                    params,
+                    headers,
+                    timeout_seconds=timeout_seconds,
+                )
         else:
-            response = self._get_once(self._client, params, headers)
+            response = self._get_once(
+                self._client,
+                params,
+                headers,
+                timeout_seconds=timeout_seconds,
+            )
 
         if response.status_code == 429:
             raise RateLimitedError(_parse_retry_after_seconds(response.headers.get("Retry-After")))
@@ -105,9 +116,16 @@ class ArxivApiFetcher:
         client: httpx.Client,
         params: dict[str, str],
         headers: dict[str, str],
+        *,
+        timeout_seconds: float,
     ) -> httpx.Response:
         try:
-            return client.get(self.settings.arxiv_api_url, params=params, headers=headers)
+            return client.get(
+                self.settings.arxiv_api_url,
+                params=params,
+                headers=headers,
+                timeout=timeout_seconds,
+            )
         except httpx.RequestError as exc:
             raise TransientFetchError(f"arXiv API request failed: {exc}") from exc
 

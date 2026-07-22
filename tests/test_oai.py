@@ -246,6 +246,7 @@ class FakeOaiFetcher:
         from_datestamp: str | None = None,
         until_datestamp: str | None = None,
         resumption_token: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> OaiPmhPage:
         self.seen.append(
             {
@@ -254,6 +255,7 @@ class FakeOaiFetcher:
                 "from_datestamp": from_datestamp,
                 "until_datestamp": until_datestamp,
                 "resumption_token": resumption_token,
+                "timeout_seconds": timeout_seconds,
             }
         )
         response = self.responses.pop(0)
@@ -381,6 +383,26 @@ def test_oai_fetcher_429_stays_a_true_429_rate_limit(settings: HuldraSettings) -
     assert exc.value.retry_after_seconds == 42
     assert exc.value.rate_limit_kind == "http_429"
     assert exc.value.api_family == "oai_pmh"
+
+
+def test_oai_fetcher_caps_http_timeout_to_remaining_runtime(
+    settings: HuldraSettings,
+) -> None:
+    observed_timeouts: list[dict[str, float]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        observed_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, text=OAI_NO_RECORDS_MATCH)
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+
+    OaiPmhFetcher(settings, client=client).list_records(
+        metadata_prefix="arXiv",
+        timeout_seconds=0.05,
+    )
+
+    assert len(observed_timeouts) == 1
+    assert set(observed_timeouts[0].values()) == {0.05}
 
 
 def test_oai_fetcher_malformed_200_raises_transient_fetch_error(
@@ -993,6 +1015,58 @@ def test_oai_expired_runtime_budget_stops_before_fetch(
     assert result.status == "budget_exceeded"
     assert result.error_category == "runtime_budget_exceeded"
     assert fetcher.seen == []
+
+
+def test_oai_harvest_caps_each_request_to_remaining_runtime(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    clock = _OaiAuditClock(started)
+    monkeypatch.setattr(broker_module, "utc_now", clock.now)
+    monkeypatch.setattr(db_module, "utc_now", clock.now)
+    monkeypatch.setattr(limiter_module, "utc_now", clock.now)
+    original_started = store.record_oai_request_started
+    original_renew = store.renew_leases_if_owned
+
+    def account_with_delay(harvest_id: str) -> int:
+        requests_total = original_started(harvest_id)
+        clock.current += timedelta(seconds=1)
+        return requests_total
+
+    def renew_with_delay(
+        leases: tuple[tuple[str, str, int], ...],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        renewed = original_renew(leases, now=now)
+        if len(leases) == 2:
+            clock.current += timedelta(seconds=2)
+        return renewed
+
+    monkeypatch.setattr(store, "record_oai_request_started", account_with_delay)
+    monkeypatch.setattr(store, "renew_leases_if_owned", renew_with_delay)
+    fetcher = FakeOaiFetcher([parse_oai_pmh_list_records(OAI_DELETED_PAGE)], [])
+    tuned = settings.model_copy(update={"request_timeout_seconds": 30.0})
+
+    result = HuldraBroker(
+        store=store,
+        settings=tuned,
+        oai_fetcher=fetcher,
+    ).harvest_oai(
+        OaiHarvestRequest(
+            client_id="test",
+            metadata_prefix="arXiv",
+            mode=OaiHarvestMode.INITIAL,
+            runtime_budget_seconds=4,
+            max_pages=1,
+            max_requests=1,
+        )
+    )
+
+    assert result.status == "completed"
+    assert fetcher.seen[0]["timeout_seconds"] == 1.0
 
 
 def test_oai_running_harvest_backfills_missing_deadline_once(

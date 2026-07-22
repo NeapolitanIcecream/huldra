@@ -147,6 +147,7 @@ def test_migration_adds_durable_upstream_budget_to_existing_workflow_tables(
     tmp_path: Path,
 ) -> None:
     db = tmp_path / "old-workflow.db"
+    request = ArxivRequest(client_id="legacy", search_query="cat:cs.AI")
     with closing(sqlite3.connect(db)) as conn:
         conn.executescript(
             """
@@ -186,6 +187,18 @@ def test_migration_adds_durable_upstream_budget_to_existing_workflow_tables(
             );
             """
         )
+        conn.execute(
+            """
+            INSERT INTO queue_items(
+                request_id, cache_key, client_id, request_json,
+                status, created_at, updated_at
+            )
+            VALUES ('legacy-request', 'legacy-key', 'legacy', ?,
+                    'queued', '2026-01-01T00:00:00+00:00',
+                    '2026-01-01T00:00:00+00:00')
+            """,
+            (request.model_dump_json(),),
+        )
 
         apply_migrations(conn)
 
@@ -218,14 +231,18 @@ def test_migration_adds_durable_upstream_budget_to_existing_workflow_tables(
             ).fetchall()
         }
         version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        unbudgeted_demand = conn.execute(
+            "SELECT unbudgeted_demand FROM queue_items WHERE request_id='legacy-request'"
+        ).fetchone()[0]
 
-    assert "upstream_budget_id" in queue_columns
+    assert {"upstream_budget_id", "unbudgeted_demand"} <= queue_columns
     assert "upstream_budget_id" in sync_columns
     assert budget_table == ("upstream_request_budgets",)
     assert index == ("idx_queue_upstream_budget",)
     assert membership_table == ("queue_item_upstream_budgets",)
     assert membership_index == ("idx_queue_item_upstream_budgets_budget",)
     assert {"first_attempt_number", "last_charged_attempt"} <= membership_columns
+    assert unbudgeted_demand == 1
     assert version == 8
 
 
