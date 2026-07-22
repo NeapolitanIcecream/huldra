@@ -542,6 +542,14 @@ class HuldraStore:
             )
         return budget_id
 
+    def get_upstream_request_budget_requests_started(self, budget_id: str) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT requests_started FROM upstream_request_budgets WHERE budget_id=?",
+                (budget_id,),
+            ).fetchone()
+        return int(row["requests_started"]) if row is not None else None
+
     def reserve_upstream_request(
         self,
         budget_id: str,

@@ -1288,6 +1288,21 @@ class HuldraBroker:
             next_start += target.request.max_results
 
         missing_pages_total = sum(1 for _request, _key, cached in planned_pages if cached is None)
+        requests_started = self.store.get_upstream_request_budget_requests_started(
+            budget.upstream_budget_id
+        )
+        if requests_started is None:
+            self._complete_window_budget_failure(
+                target,
+                first,
+                error_category="request_budget_exceeded",
+                error_message="upstream request budget no longer exists",
+            )
+            return result
+        # Admission reserves unique cache misses optimistically. Reconcile that
+        # estimate after each drain because another process may have filled a
+        # missing page without consuming this maintenance budget.
+        budget.reserved_requests = requests_started
         if budget.reserved_requests + missing_pages_total > budget.max_requests_total:
             self._complete_window_budget_failure(
                 target,
@@ -1295,7 +1310,7 @@ class HuldraBroker:
                 error_category="request_budget_exceeded",
                 error_message=(
                     f"complete window would reserve {missing_pages_total} additional requests; "
-                    f"{budget.reserved_requests} of {budget.max_requests_total} already reserved"
+                    f"{budget.reserved_requests} of {budget.max_requests_total} already used"
                 ),
             )
             return result

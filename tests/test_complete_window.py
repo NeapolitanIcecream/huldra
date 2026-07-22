@@ -172,6 +172,66 @@ def test_complete_window_cached_first_page_allows_immediate_followup(
     assert [seen.start for seen in fetcher.seen] == [1]
 
 
+def test_complete_window_releases_initial_reservation_for_concurrent_cache_fill(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    original_enqueue = store.enqueue_request_for_work
+    initial_cache_filled = False
+
+    def fill_initial_cache_before_enqueue(
+        queued_request: ArxivRequest,
+        cache_key: str | None = None,
+        *,
+        work_kind: QueueWorkKind | None = None,
+        upstream_budget_id: str | None = None,
+        default_timeout_seconds: float = 30.0,
+    ) -> tuple[QueueItem, bool]:
+        nonlocal initial_cache_filled
+        if queued_request.start == 0 and not initial_cache_filled:
+            initial_cache_filled = True
+            store.record_completed_cache_entry(
+                cache_key=request_cache_key(queued_request),
+                request=queued_request,
+                papers=[make_paper("2401.00001v1")],
+                total_results=2,
+                upstream_request_count=0,
+            )
+        return original_enqueue(
+            queued_request,
+            cache_key,
+            work_kind=work_kind,
+            upstream_budget_id=upstream_budget_id,
+            default_timeout_seconds=default_timeout_seconds,
+        )
+
+    monkeypatch.setattr(store, "enqueue_request_for_work", fill_initial_cache_before_enqueue)
+    fetcher = CapturingFetcher(
+        [FetchResult([make_paper("2401.00002v1")], total_results=2)],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=4,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=2,
+        max_requests_total=1,
+    )
+
+    assert result.complete_windows_total == 1
+    assert result.requests[0].error_category is None
+    assert [seen.start for seen in fetcher.seen] == [1]
+    with store.connect() as conn:
+        requests_started = conn.execute(
+            "SELECT requests_started FROM upstream_request_budgets"
+        ).fetchone()[0]
+    assert requests_started == 1
+
+
 def test_complete_window_caps_atom_request_to_remaining_runtime(
     store: HuldraStore,
     settings: HuldraSettings,
