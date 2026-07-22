@@ -543,6 +543,48 @@ def test_swr_refreshes_once_only_after_persisted_refresh_deadline(
     assert reserved.refresh_after > now
 
 
+def test_swr_persists_a_shorter_future_refresh_deadline(
+    store: HuldraStore,
+) -> None:
+    completed_at = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    cached_request = ArxivRequest(
+        client_id="writer",
+        search_query="cat:cs.AI",
+        refresh_interval_seconds=3600,
+    )
+    key = request_cache_key(cached_request)
+    store.record_completed_cache_entry(
+        cache_key=key,
+        request=cached_request,
+        papers=[make_paper()],
+        completed_at=completed_at,
+    )
+    shorter = cached_request.model_copy(
+        update={
+            "client_id": "short-reader",
+            "cache_policy": CachePolicy.STALE_WHILE_REVALIDATE,
+            "refresh_interval_seconds": 600,
+        }
+    )
+
+    early_item, _joined = store.enqueue_refresh_if_due(
+        shorter,
+        now=completed_at + timedelta(minutes=5),
+    )
+    shortened = store.get_cache_entry(key)
+    due_item, _joined = store.enqueue_refresh_if_due(
+        cached_request.model_copy(
+            update={"cache_policy": CachePolicy.STALE_WHILE_REVALIDATE}
+        ),
+        now=completed_at + timedelta(minutes=11),
+    )
+
+    assert early_item is None
+    assert shortened is not None
+    assert shortened.refresh_after == completed_at + timedelta(minutes=10)
+    assert due_item is not None
+
+
 def test_joined_swr_refresh_uses_shortest_requested_interval(
     store: HuldraStore,
     settings: HuldraSettings,

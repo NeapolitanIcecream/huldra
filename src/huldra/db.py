@@ -1978,6 +1978,11 @@ class HuldraStore:
             ):
                 effective_refresh_after = requested_refresh_after
             if effective_refresh_after is not None and effective_refresh_after > current:
+                if effective_refresh_after != refresh_after:
+                    conn.execute(
+                        "UPDATE cache_entries SET refresh_after = ? WHERE cache_key = ?",
+                        (isoformat_or_none(effective_refresh_after), key),
+                    )
                 return None, False
             conn.execute(
                 "UPDATE cache_entries SET refresh_after = ? WHERE cache_key = ?",
