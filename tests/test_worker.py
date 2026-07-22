@@ -47,6 +47,15 @@ class FakeFetcher:
         return response  # type: ignore[return-value]
 
 
+@dataclass
+class CapturingFetcher:
+    seen: list[ArxivRequest]
+
+    def fetch(self, request: ArxivRequest) -> FetchResult:
+        self.seen.append(request)
+        return FetchResult([make_paper()], total_results=1)
+
+
 def _advance_clock_after_write_lock(
     store: HuldraStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -154,6 +163,60 @@ def test_worker_successfully_processes_queued_item(
     assert fetcher.calls == 1
     assert store.get_cache_entry(result.cache_key or "") is not None
     assert store.status_summary().papers_total == 1
+
+
+def test_shared_budget_fetch_uses_longest_viable_deadline(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("huldra.db.utc_now", lambda: started)
+    monkeypatch.setattr("huldra.limiter.utc_now", lambda: started)
+    monkeypatch.setattr("huldra.worker.utc_now", lambda: started)
+    tuned = settings.model_copy(update={"request_timeout_seconds": 30.0})
+    short_budget = store.create_upstream_request_budget(
+        max_requests=1,
+        deadline_at=started + timedelta(seconds=1),
+    )
+    long_budget = store.create_upstream_request_budget(
+        max_requests=1,
+        deadline_at=started + timedelta(seconds=12),
+    )
+    request = ArxivRequest(client_id="maintenance", search_query="cat:cs.AI")
+    store.enqueue_request_for_work(request, upstream_budget_id=short_budget)
+    store.enqueue_request_for_work(request, upstream_budget_id=long_budget)
+    fetcher = CapturingFetcher([])
+
+    result = HuldraWorker(store, tuned, fetcher=fetcher).run_once()
+
+    assert result.status == "completed"
+    assert fetcher.seen[0].timeout_seconds == pytest.approx(12.0)
+
+
+def test_unbudgeted_demand_keeps_normal_timeout_for_shared_fetch(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("huldra.db.utc_now", lambda: started)
+    monkeypatch.setattr("huldra.limiter.utc_now", lambda: started)
+    monkeypatch.setattr("huldra.worker.utc_now", lambda: started)
+    tuned = settings.model_copy(update={"request_timeout_seconds": 30.0})
+    request = ArxivRequest(client_id="ordinary", search_query="cat:cs.AI")
+    store.enqueue_request(request)
+    short_budget = store.create_upstream_request_budget(
+        max_requests=1,
+        deadline_at=started + timedelta(seconds=1),
+    )
+    store.enqueue_request_for_work(request, upstream_budget_id=short_budget)
+    fetcher = CapturingFetcher([])
+
+    result = HuldraWorker(store, tuned, fetcher=fetcher).run_once()
+
+    assert result.status == "completed"
+    assert fetcher.seen[0].timeout_seconds is None
 
 
 def test_worker_rechecks_claim_and_cache_after_rate_wait(

@@ -768,23 +768,34 @@ class HuldraStore:
             return _queue_item_upstream_budget_ids_conn(conn, request_id)
 
     def queue_item_upstream_deadline(self, request_id: str) -> datetime | None:
-        """Return the earliest deadline funding the queue item's current attempt."""
+        """Return the least restrictive deadline among current-attempt consumers."""
         with self.connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT MIN(budget.deadline_at) AS deadline_at
+                SELECT item.unbudgeted_demand,
+                       membership.budget_id,
+                       budget.deadline_at
                 FROM queue_items AS item
-                JOIN queue_item_upstream_budgets AS membership
+                LEFT JOIN queue_item_upstream_budgets AS membership
                   ON membership.request_id=item.request_id
                  AND membership.first_attempt_number <= item.attempts_total
-                JOIN upstream_request_budgets AS budget
+                LEFT JOIN upstream_request_budgets AS budget
                   ON budget.budget_id=membership.budget_id
                 WHERE item.request_id=?
-                  AND budget.deadline_at IS NOT NULL
                 """,
                 (request_id,),
-            ).fetchone()
-        return from_isoformat_or_none(row["deadline_at"]) if row is not None else None
+            ).fetchall()
+        if not rows or bool(rows[0]["unbudgeted_demand"]):
+            return None
+        deadlines: list[datetime] = []
+        for row in rows:
+            if row["budget_id"] is None:
+                continue
+            deadline = from_isoformat_or_none(row["deadline_at"])
+            if deadline is None:
+                return None
+            deadlines.append(deadline)
+        return max(deadlines, default=None)
 
     def fail_active_upstream_budget_items(
         self,
