@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from huldra.config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from huldra.keys import arxiv_id_family_base, arxiv_version, normalize_arxiv_id, request_cache_key
 from huldra.migrations import apply_migrations
 from huldra.models import (
@@ -1900,8 +1901,18 @@ class HuldraStore:
                 ),
             )
 
-    def enqueue_request(self, request: ArxivRequest, cache_key: str | None = None) -> QueueItem:
-        item, _joined = self.enqueue_request_for_work(request, cache_key)
+    def enqueue_request(
+        self,
+        request: ArxivRequest,
+        cache_key: str | None = None,
+        *,
+        default_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ) -> QueueItem:
+        item, _joined = self.enqueue_request_for_work(
+            request,
+            cache_key,
+            default_timeout_seconds=default_timeout_seconds,
+        )
         return item
 
     def enqueue_request_for_work(
@@ -1911,6 +1922,7 @@ class HuldraStore:
         *,
         work_kind: QueueWorkKind | None = None,
         upstream_budget_id: str | None = None,
+        default_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> tuple[QueueItem, bool]:
         key = cache_key or request_cache_key(request)
         resolved_work_kind = work_kind or (
@@ -1928,6 +1940,7 @@ class HuldraStore:
                 cache_key=key,
                 work_kind=resolved_work_kind,
                 upstream_budget_id=upstream_budget_id,
+                default_timeout_seconds=default_timeout_seconds,
                 now_s=now_s,
             )
 
@@ -1937,6 +1950,7 @@ class HuldraStore:
         cache_key: str | None = None,
         *,
         now: datetime | None = None,
+        default_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> tuple[QueueItem | None, bool]:
         """Atomically reserve a refresh period and enqueue at most one refresh."""
         key = cache_key or request_cache_key(request)
@@ -1963,6 +1977,7 @@ class HuldraStore:
                     cache_key=key,
                     work_kind=QueueWorkKind.REFRESH_COMPLETED,
                     upstream_budget_id=None,
+                    default_timeout_seconds=default_timeout_seconds,
                     now_s=current_s,
                 )
             cache = conn.execute(
@@ -2005,6 +2020,7 @@ class HuldraStore:
                 cache_key=key,
                 work_kind=QueueWorkKind.REFRESH_COMPLETED,
                 upstream_budget_id=None,
+                default_timeout_seconds=default_timeout_seconds,
                 now_s=current_s,
             )
 
@@ -2016,6 +2032,7 @@ class HuldraStore:
         cache_key: str,
         work_kind: QueueWorkKind,
         upstream_budget_id: str | None,
+        default_timeout_seconds: float,
         now_s: str,
     ) -> tuple[QueueItem, bool]:
         existing = conn.execute(
@@ -2029,12 +2046,14 @@ class HuldraStore:
         ).fetchone()
         if existing is not None:
             queue_item_changed = False
+            existing_request = _request_from_json(existing["request_json"])
             replacement_request: ArxivRequest | None = None
+            replacement_work_kind = QueueWorkKind(existing["work_kind"])
             if work_kind == QueueWorkKind.REFRESH_COMPLETED:
-                if existing["work_kind"] != QueueWorkKind.REFRESH_COMPLETED:
+                if replacement_work_kind != QueueWorkKind.REFRESH_COMPLETED:
                     replacement_request = request
+                    replacement_work_kind = QueueWorkKind.REFRESH_COMPLETED
                 else:
-                    existing_request = _request_from_json(existing["request_json"])
                     if (
                         request.refresh_interval_seconds
                         < existing_request.refresh_interval_seconds
@@ -2044,16 +2063,30 @@ class HuldraStore:
                                 "refresh_interval_seconds": request.refresh_interval_seconds,
                             }
                         )
+            merged_request = replacement_request or existing_request
+            effective_timeout_seconds = max(
+                existing_request.timeout_seconds or default_timeout_seconds,
+                request.timeout_seconds or default_timeout_seconds,
+            )
+            effective_priority = max(existing_request.priority, request.priority)
+            request_updates: dict[str, object] = {}
+            if merged_request.timeout_seconds != effective_timeout_seconds:
+                request_updates["timeout_seconds"] = effective_timeout_seconds
+            if merged_request.priority != effective_priority:
+                request_updates["priority"] = effective_priority
+            if request_updates:
+                replacement_request = merged_request.model_copy(update=request_updates)
             if replacement_request is not None:
                 conn.execute(
                     """
                     UPDATE queue_items
-                    SET work_kind=?, request_json=?, updated_at=?
+                    SET work_kind=?, request_json=?, priority=?, updated_at=?
                     WHERE request_id=?
                     """,
                     (
-                        QueueWorkKind.REFRESH_COMPLETED,
+                        replacement_work_kind,
                         _request_json(replacement_request),
+                        replacement_request.priority,
                         now_s,
                         existing["request_id"],
                     ),

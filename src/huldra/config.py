@@ -8,6 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from huldra import __version__
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+
 
 def default_db_path() -> Path:
     return Path(user_data_dir("huldra")) / "huldra.db"
@@ -24,7 +26,7 @@ class HuldraSettings(BaseSettings):
     rate_limit_backoff_multiplier: float = Field(default=2.0, ge=1.0)
     rate_limit_max_cooldown_seconds: float = Field(default=86400.0, gt=0.0)
     rate_limit_jitter_seconds: float = Field(default=60.0, ge=0.0)
-    request_timeout_seconds: float = 30.0
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     worker_poll_interval_seconds: float = Field(default=300.0, ge=1.0)
     lease_timeout_seconds: int = 120
     queue_claim_timeout_seconds: int = 300

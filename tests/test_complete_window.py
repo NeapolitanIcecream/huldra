@@ -666,6 +666,7 @@ def test_complete_window_rechecks_deadline_before_each_followup_enqueue(
         *,
         work_kind: QueueWorkKind | None = None,
         upstream_budget_id: str | None = None,
+        default_timeout_seconds: float = 30.0,
     ) -> tuple[QueueItem, bool]:
         enqueued_at.append((request.start, monotonic_now[0]))
         return original_enqueue(
@@ -673,6 +674,7 @@ def test_complete_window_rechecks_deadline_before_each_followup_enqueue(
             cache_key,
             work_kind=work_kind,
             upstream_budget_id=upstream_budget_id,
+            default_timeout_seconds=default_timeout_seconds,
         )
 
     monkeypatch.setattr(store, "record_sync_job_page", record_page_then_expire)

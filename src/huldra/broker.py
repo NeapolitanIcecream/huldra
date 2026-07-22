@@ -105,6 +105,7 @@ class HuldraBroker:
                 item, _joined = self.store.enqueue_refresh_if_due(
                     request,
                     cache_key,
+                    default_timeout_seconds=self.settings.request_timeout_seconds,
                 )
                 if item is None:
                     return result
@@ -137,6 +138,7 @@ class HuldraBroker:
             request,
             cache_key,
             work_kind=QueueWorkKind.FETCH_MISSING,
+            default_timeout_seconds=self.settings.request_timeout_seconds,
         )
         rate = self.store.get_rate_state()
         if rate.cooldown_until is not None and rate.cooldown_until > utc_now():
@@ -811,6 +813,7 @@ class HuldraBroker:
                 target.cache_key,
                 work_kind=QueueWorkKind.FETCH_MISSING,
                 upstream_budget_id=budget.upstream_budget_id,
+                default_timeout_seconds=self.settings.request_timeout_seconds,
             )
             target.request_id = item.request_id
             target.joined_existing_queue = joined
@@ -1340,6 +1343,7 @@ class HuldraBroker:
                     page_key,
                     work_kind=QueueWorkKind.FETCH_MISSING,
                     upstream_budget_id=budget.upstream_budget_id,
+                    default_timeout_seconds=self.settings.request_timeout_seconds,
                 )
                 page_target.request_id = item.request_id
                 page_target.joined_existing_queue = joined

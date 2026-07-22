@@ -216,7 +216,41 @@ def test_unbudgeted_demand_keeps_normal_timeout_for_shared_fetch(
     result = HuldraWorker(store, tuned, fetcher=fetcher).run_once()
 
     assert result.status == "completed"
-    assert fetcher.seen[0].timeout_seconds is None
+    assert fetcher.seen[0].timeout_seconds == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize(
+    ("joined_timeout_seconds", "expected_timeout_seconds"),
+    [(None, 12.0), (20.0, 20.0)],
+)
+def test_deduplicated_fetch_uses_least_restrictive_requested_timeout(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    joined_timeout_seconds: float | None,
+    expected_timeout_seconds: float,
+) -> None:
+    tuned = settings.model_copy(update={"request_timeout_seconds": 12.0})
+    first = ArxivRequest(
+        client_id="short",
+        search_query="cat:cs.AI",
+        timeout_seconds=1.0,
+    )
+    joined = first.model_copy(
+        update={
+            "client_id": "later",
+            "timeout_seconds": joined_timeout_seconds,
+        }
+    )
+    broker = HuldraBroker(store=store, settings=tuned)
+    first_result = broker.ensure(first)
+    joined_result = broker.ensure(joined)
+    fetcher = CapturingFetcher([])
+
+    result = HuldraWorker(store, tuned, fetcher=fetcher).run_once()
+
+    assert first_result.request_id == joined_result.request_id
+    assert result.status == "completed"
+    assert fetcher.seen[0].timeout_seconds == pytest.approx(expected_timeout_seconds)
 
 
 def test_worker_rechecks_claim_and_cache_after_rate_wait(
