@@ -24,6 +24,7 @@ def test_migrations_are_idempotent_and_create_required_tables(tmp_path: Path) ->
             "cache_entries",
             "cache_matches",
             "queue_items",
+            "queue_item_upstream_budgets",
             "rate_state",
             "leases",
             "worker_state",
@@ -59,7 +60,7 @@ def test_migrations_are_idempotent_and_create_required_tables(tmp_path: Path) ->
         queue_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(queue_items)").fetchall()
         }
-        assert "upstream_budget_id" in queue_columns
+        assert {"upstream_budget_id", "upstream_budget_gate_closed"} <= queue_columns
         sync_job_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(sync_jobs)").fetchall()
         }
@@ -202,13 +203,60 @@ def test_migration_adds_durable_upstream_budget_to_existing_workflow_tables(
             "SELECT name FROM sqlite_master "
             "WHERE type='index' AND name='idx_queue_upstream_budget'"
         ).fetchone()
+        membership_table = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='queue_item_upstream_budgets'"
+        ).fetchone()
+        membership_index = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_queue_item_upstream_budgets_budget'"
+        ).fetchone()
+        membership_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(queue_item_upstream_budgets)"
+            ).fetchall()
+        }
         version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
 
     assert "upstream_budget_id" in queue_columns
     assert "upstream_budget_id" in sync_columns
     assert budget_table == ("upstream_request_budgets",)
     assert index == ("idx_queue_upstream_budget",)
-    assert version == 7
+    assert membership_table == ("queue_item_upstream_budgets",)
+    assert membership_index == ("idx_queue_item_upstream_budgets_budget",)
+    assert {"first_attempt_number", "last_charged_attempt"} <= membership_columns
+    assert version == 8
+
+
+def test_migration_backfills_primary_queue_budget_membership(tmp_path: Path) -> None:
+    db = tmp_path / "v7.db"
+    store = HuldraStore(db)
+    store.init_schema()
+    budget_id = store.create_upstream_request_budget(max_requests=2, deadline_at=None)
+    item, joined = store.enqueue_request_for_work(
+        ArxivRequest(client_id="legacy", search_query="cat:cs.AI"),
+        upstream_budget_id=budget_id,
+    )
+    assert not joined
+    with store.begin_immediate() as conn:
+        conn.execute(
+            "DELETE FROM queue_item_upstream_budgets WHERE request_id=?",
+            (item.request_id,),
+        )
+
+    with closing(sqlite3.connect(db)) as conn:
+        apply_migrations(conn)
+        memberships = conn.execute(
+            """
+            SELECT request_id, budget_id
+            FROM queue_item_upstream_budgets
+            WHERE request_id=?
+            """,
+            (item.request_id,),
+        ).fetchall()
+
+    assert memberships == [(item.request_id, budget_id)]
 
 
 def test_migration_preserves_legacy_429_counts_as_rate_limit_counts(tmp_path: Path) -> None:

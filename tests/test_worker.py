@@ -318,7 +318,7 @@ def test_budget_db_wait_cannot_expire_claim_and_upstream_lease_before_fetch(
     first_store = HuldraStore(tuned.db_path, timeout=5)
     second_store = HuldraStore(tuned.db_path, timeout=5)
     original_begin = first_store.begin_immediate
-    original_reserve = first_store.reserve_upstream_request
+    original_reserve = first_store.reserve_queue_item_upstream_request
 
     @contextmanager
     def signal_budget_lock_attempt() -> Iterator[sqlite3.Connection]:
@@ -328,7 +328,7 @@ def test_budget_db_wait_cannot_expire_claim_and_upstream_lease_before_fetch(
             yield conn
 
     def blocked_reserve(
-        budget: str,
+        request_id: str,
         *,
         now: datetime | None = None,
     ) -> str | None:
@@ -336,7 +336,7 @@ def test_budget_db_wait_cannot_expire_claim_and_upstream_lease_before_fetch(
         assert blocker_ready.wait(timeout=5)
         reserve_active.set()
         try:
-            outcome = original_reserve(budget, now=now)
+            outcome = original_reserve(request_id, now=now)
         finally:
             reserve_active.clear()
         reserve_committed.set()
@@ -344,7 +344,11 @@ def test_budget_db_wait_cannot_expire_claim_and_upstream_lease_before_fetch(
         return outcome
 
     monkeypatch.setattr(first_store, "begin_immediate", signal_budget_lock_attempt)
-    monkeypatch.setattr(first_store, "reserve_upstream_request", blocked_reserve)
+    monkeypatch.setattr(
+        first_store,
+        "reserve_queue_item_upstream_request",
+        blocked_reserve,
+    )
 
     def advance_clock(seconds: float) -> None:
         clock[0] += timedelta(seconds=seconds)

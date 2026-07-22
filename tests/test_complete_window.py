@@ -401,6 +401,46 @@ def test_complete_window_request_budget_caps_retried_upstream_attempts(
     assert entry.upstream_requests_total == 1
 
 
+def test_complete_window_joined_queue_item_consumes_maintenance_budget(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    existing = store.enqueue_request(request)
+    fetcher = CapturingFetcher([FetchResult([make_paper()], total_results=1)], [])
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=30,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    assert result.completed_windows_total == 1
+    assert len(fetcher.seen) == 1
+    with store.connect() as conn:
+        budget = conn.execute(
+            """
+            SELECT budget.budget_id, budget.requests_started
+            FROM sync_jobs AS job
+            JOIN upstream_request_budgets AS budget
+              ON budget.budget_id = job.upstream_budget_id
+            """
+        ).fetchone()
+        membership = conn.execute(
+            """
+            SELECT budget_id, last_charged_attempt
+            FROM queue_item_upstream_budgets
+            WHERE request_id=?
+            """,
+            (existing.request_id,),
+        ).fetchone()
+    assert tuple(budget) == (membership["budget_id"], 1)
+    assert membership["last_charged_attempt"] == 1
+
+
 def test_complete_window_rechecks_deadline_before_each_followup_enqueue(
     store: HuldraStore,
     settings: HuldraSettings,
@@ -493,19 +533,19 @@ def test_complete_window_rechecks_deadline_after_budget_reservation_before_netwo
     monkeypatch.setattr(db_module, "utc_now", now)
     monkeypatch.setattr(limiter_module, "utc_now", now)
     monkeypatch.setattr(worker_module, "utc_now", now)
-    original_reserve = store.reserve_upstream_request
+    original_reserve = store.reserve_queue_item_upstream_request
 
     def reserve_then_expire(
-        budget_id: str,
+        request_id: str,
         *,
         now: datetime | None = None,
     ) -> str | None:
-        outcome = original_reserve(budget_id, now=now)
+        outcome = original_reserve(request_id, now=now)
         wall_now[0] += timedelta(seconds=5)
         elapsed[0] += 5
         return outcome
 
-    monkeypatch.setattr(store, "reserve_upstream_request", reserve_then_expire)
+    monkeypatch.setattr(store, "reserve_queue_item_upstream_request", reserve_then_expire)
     fetcher = CapturingFetcher([FetchResult([make_paper()], total_results=1)], [])
 
     result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(

@@ -194,14 +194,10 @@ class HuldraWorker:
         if ownership_result is not None:
             return ownership_result
 
-        budget_error = (
-            self.store.reserve_upstream_request(item.upstream_budget_id)
-            if item.upstream_budget_id is not None
-            else None
-        )
-        if budget_error is None and item.upstream_budget_id is not None:
-            budget_error = self.store.check_upstream_request_deadline(
-                item.upstream_budget_id
+        budget_error = self.store.reserve_queue_item_upstream_request(item.request_id)
+        if budget_error is None:
+            budget_error = self.store.check_queue_item_upstream_request_deadlines(
+                item.request_id
             )
         if budget_error is not None:
             self.store.release_lease(self.limiter.lease_name, self.owner_token)

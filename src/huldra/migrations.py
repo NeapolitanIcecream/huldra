@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
@@ -79,6 +79,7 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             status TEXT NOT NULL,
             work_kind TEXT NOT NULL DEFAULT 'fetch_missing',
             upstream_budget_id TEXT,
+            upstream_budget_gate_closed INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             claimed_by TEXT,
@@ -105,6 +106,18 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS queue_item_upstream_budgets (
+            request_id TEXT NOT NULL REFERENCES queue_items(request_id) ON DELETE CASCADE,
+            budget_id TEXT NOT NULL REFERENCES upstream_request_budgets(budget_id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            first_attempt_number INTEGER NOT NULL DEFAULT 1,
+            last_charged_attempt INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (request_id, budget_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_queue_item_upstream_budgets_budget
+            ON queue_item_upstream_budgets(budget_id, request_id);
 
         CREATE TABLE IF NOT EXISTS rate_state (
             name TEXT PRIMARY KEY,
@@ -259,10 +272,40 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     _ensure_rate_limit_diagnostics(conn)
     _ensure_queue_items_work_kind(conn)
     _ensure_column(conn, "queue_items", "upstream_budget_id", "TEXT")
+    _ensure_column(
+        conn,
+        "queue_items",
+        "upstream_budget_gate_closed",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     _ensure_column(conn, "sync_jobs", "upstream_budget_id", "TEXT")
+    _ensure_column(
+        conn,
+        "queue_item_upstream_budgets",
+        "first_attempt_number",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    _ensure_column(
+        conn,
+        "queue_item_upstream_budgets",
+        "last_charged_attempt",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_queue_upstream_budget "
         "ON queue_items(upstream_budget_id)"
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO queue_item_upstream_budgets(
+            request_id, budget_id, created_at,
+            first_attempt_number, last_charged_attempt
+        )
+        SELECT request_id, upstream_budget_id, created_at,
+               1, attempts_total
+        FROM queue_items
+        WHERE upstream_budget_id IS NOT NULL
+        """
     )
     _ensure_column(conn, "cache_entries", "coverage_status", "TEXT NOT NULL DEFAULT 'unknown'")
     _ensure_column(conn, "cache_entries", "refresh_after", "TEXT")

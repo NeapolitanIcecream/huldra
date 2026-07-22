@@ -50,6 +50,7 @@ _RETENTION_TABLES = frozenset(
         "cache_entries",
         "events",
         "queue_items",
+        "queue_item_upstream_budgets",
         "sync_jobs",
         "sync_job_pages",
         "upstream_request_budgets",
@@ -471,6 +472,8 @@ class HuldraStore:
             row = conn.execute("SELECT * FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()
             if row is None:
                 row = _oai_base_paper_row_for_versioned_read(conn, arxiv_id)
+            if row is None:
+                row = _latest_versioned_paper_row_for_base_read(conn, arxiv_id)
         return _paper_from_row(row) if row else None
 
     def mark_paper_deleted(
@@ -547,12 +550,77 @@ class HuldraStore:
         """Atomically consume one upstream attempt or return a terminal budget error."""
         with self.begin_immediate() as conn:
             current = ensure_utc(now or utc_now())
-            current_s = isoformat_or_none(current)
-            assert current_s is not None
+            return self._reserve_upstream_budgets_conn(
+                conn,
+                (budget_id,),
+                current=current,
+            )
+
+    def reserve_queue_item_upstream_request(
+        self,
+        request_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Atomically charge one shared fetch to every joined maintenance budget."""
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            attempt_number, budget_ids, uncharged_budget_ids = (
+                _queue_item_upstream_budget_attempt_state_conn(conn, request_id)
+            )
+            deadline_error = _check_upstream_budget_deadlines_conn(
+                conn,
+                budget_ids,
+                current=current,
+            )
+            if deadline_error is not None:
+                return deadline_error
+            budget_error = self._reserve_upstream_budgets_conn(
+                conn,
+                uncharged_budget_ids,
+                current=current,
+            )
+            if budget_error is not None:
+                return budget_error
+            if uncharged_budget_ids:
+                placeholders = ",".join("?" for _ in uncharged_budget_ids)
+                conn.execute(
+                    f"""
+                    UPDATE queue_item_upstream_budgets
+                    SET last_charged_attempt=?
+                    WHERE request_id=?
+                      AND budget_id IN ({placeholders})
+                    """,
+                    (attempt_number, request_id, *uncharged_budget_ids),
+                )
+            conn.execute(
+                """
+                UPDATE queue_items
+                SET upstream_budget_gate_closed=1
+                WHERE request_id=? AND status='claimed'
+                """,
+                (request_id,),
+            )
+            return None
+
+    def _reserve_upstream_budgets_conn(
+        self,
+        conn: sqlite3.Connection,
+        budget_ids: tuple[str, ...],
+        *,
+        current: datetime,
+    ) -> str | None:
+        if not budget_ids:
+            return None
+        current_s = isoformat_or_none(current)
+        assert current_s is not None
+        budgets: list[sqlite3.Row] = []
+        for budget_id in budget_ids:
             budget = conn.execute(
                 "SELECT * FROM upstream_request_budgets WHERE budget_id=?",
                 (budget_id,),
             ).fetchone()
+            error_category: str | None = None
             if budget is None:
                 error_category = "request_budget_exceeded"
             else:
@@ -561,26 +629,28 @@ class HuldraStore:
                     error_category = "deadline_budget_exceeded"
                 elif int(budget["requests_started"]) >= int(budget["max_requests"]):
                     error_category = "request_budget_exceeded"
-                else:
-                    conn.execute(
-                        """
-                        UPDATE upstream_request_budgets
-                        SET requests_started=requests_started + 1,
-                            updated_at=?
-                        WHERE budget_id=?
-                        """,
-                        (current_s, budget_id),
-                    )
-                    return None
-            self._record_event_conn(
-                conn,
-                "upstream_budget_exhausted",
-                {
-                    "budget_id": budget_id,
-                    "error_category": error_category,
-                },
-            )
-        return error_category
+            if error_category is not None:
+                self._record_event_conn(
+                    conn,
+                    "upstream_budget_exhausted",
+                    {
+                        "budget_id": budget_id,
+                        "error_category": error_category,
+                    },
+                )
+                return error_category
+            assert budget is not None
+            budgets.append(budget)
+        conn.executemany(
+            """
+            UPDATE upstream_request_budgets
+            SET requests_started=requests_started + 1,
+                updated_at=?
+            WHERE budget_id=?
+            """,
+            ((current_s, str(budget["budget_id"])) for budget in budgets),
+        )
+        return None
 
     def check_upstream_request_deadline(
         self,
@@ -591,16 +661,33 @@ class HuldraStore:
         """Recheck the durable wall deadline immediately before network I/O."""
         with self.begin_immediate() as conn:
             current = ensure_utc(now or utc_now())
-            budget = conn.execute(
-                "SELECT deadline_at FROM upstream_request_budgets WHERE budget_id=?",
+            return _check_upstream_budget_deadlines_conn(
+                conn,
                 (budget_id,),
-            ).fetchone()
-            if budget is None:
-                return "request_budget_exceeded"
-            deadline_at = from_isoformat_or_none(budget["deadline_at"])
-            if deadline_at is not None and current >= deadline_at:
-                return "deadline_budget_exceeded"
-        return None
+                current=current,
+            )
+
+    def check_queue_item_upstream_request_deadlines(
+        self,
+        request_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Recheck every joined budget after database waits and before network I/O."""
+        with self.begin_immediate() as conn:
+            current = ensure_utc(now or utc_now())
+            _attempt_number, budget_ids, _uncharged_budget_ids = (
+                _queue_item_upstream_budget_attempt_state_conn(conn, request_id)
+            )
+            return _check_upstream_budget_deadlines_conn(
+                conn,
+                budget_ids,
+                current=current,
+            )
+
+    def queue_item_upstream_budget_ids(self, request_id: str) -> tuple[str, ...]:
+        with self.connect() as conn:
+            return _queue_item_upstream_budget_ids_conn(conn, request_id)
 
     def fail_active_upstream_budget_items(
         self,
@@ -620,16 +707,26 @@ class HuldraStore:
                     updated_at=?,
                     claimed_by=NULL,
                     claimed_until=NULL,
+                    upstream_budget_gate_closed=0,
                     next_attempt_at=NULL,
                     error_category=?,
                     error_message=?
-                WHERE upstream_budget_id=?
+                WHERE (
+                    upstream_budget_id=?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM queue_item_upstream_budgets AS membership
+                        WHERE membership.request_id=queue_items.request_id
+                          AND membership.budget_id=?
+                    )
+                )
                   AND status IN ('queued', 'delayed', 'claimed')
                 """,
                 (
                     timestamp,
                     error_category,
                     error_message[:1000],
+                    budget_id,
                     budget_id,
                 ),
             )
@@ -1775,6 +1872,7 @@ class HuldraStore:
             (cache_key,),
         ).fetchone()
         if existing is not None:
+            queue_item_changed = False
             if (
                 work_kind == QueueWorkKind.REFRESH_COMPLETED
                 and existing["work_kind"] != QueueWorkKind.REFRESH_COMPLETED
@@ -1792,6 +1890,42 @@ class HuldraStore:
                         existing["request_id"],
                     ),
                 )
+                queue_item_changed = True
+            if upstream_budget_id is not None:
+                attempts_total = int(existing["attempts_total"])
+                joins_current_attempt = (
+                    existing["status"] == RequestStatus.CLAIMED
+                    and not bool(existing["upstream_budget_gate_closed"])
+                )
+                first_attempt_number = max(
+                    1,
+                    attempts_total if joins_current_attempt else attempts_total + 1,
+                )
+                conn.execute(
+                    """
+                    UPDATE queue_items
+                    SET upstream_budget_id=COALESCE(upstream_budget_id, ?),
+                        updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (upstream_budget_id, now_s, existing["request_id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO queue_item_upstream_budgets(
+                        request_id, budget_id, created_at, first_attempt_number
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        existing["request_id"],
+                        upstream_budget_id,
+                        now_s,
+                        first_attempt_number,
+                    ),
+                )
+                queue_item_changed = True
+            if queue_item_changed:
                 existing = conn.execute(
                     "SELECT * FROM queue_items WHERE request_id = ?",
                     (existing["request_id"],),
@@ -1819,6 +1953,16 @@ class HuldraStore:
                 now_s,
             ),
         )
+        if upstream_budget_id is not None:
+            conn.execute(
+                """
+                INSERT INTO queue_item_upstream_budgets(
+                    request_id, budget_id, created_at, first_attempt_number
+                )
+                VALUES (?, ?, ?, 1)
+                """,
+                (request_id, upstream_budget_id, now_s),
+            )
         self._record_event_conn(
             conn,
             "request_enqueued",
@@ -1889,6 +2033,7 @@ class HuldraStore:
                 SET status='claimed',
                     claimed_by=?,
                     claimed_until=?,
+                    upstream_budget_gate_closed=0,
                     attempts_total=attempts_total + 1,
                     updated_at=?
                 WHERE request_id=?
@@ -2076,6 +2221,7 @@ class HuldraStore:
                 updated_at=?,
                 claimed_by=NULL,
                 claimed_until=NULL,
+                upstream_budget_gate_closed=0,
                 error_category=NULL,
                 error_message=NULL
             WHERE request_id IN ({placeholders})
@@ -2121,6 +2267,7 @@ class HuldraStore:
                 UPDATE queue_items
                 SET status=?, next_attempt_at=?, updated_at=?,
                     claimed_by=NULL, claimed_until=NULL,
+                    upstream_budget_gate_closed=0,
                     error_category=?, error_message=?
                 WHERE request_id=?
                 """,
@@ -2570,6 +2717,10 @@ class HuldraStore:
                     WHERE item.upstream_budget_id = budget.budget_id
                 )
                   AND NOT EXISTS (
+                    SELECT 1 FROM queue_item_upstream_budgets AS membership
+                    WHERE membership.budget_id = budget.budget_id
+                )
+                  AND NOT EXISTS (
                     SELECT 1 FROM sync_jobs AS job
                     WHERE job.upstream_budget_id = budget.budget_id
                 )
@@ -2864,6 +3015,80 @@ def _version_family_merge_preference(arxiv_id: str) -> tuple[int, str]:
 
 def _sqlite_like_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _queue_item_upstream_budget_ids_conn(
+    conn: sqlite3.Connection,
+    request_id: str,
+) -> tuple[str, ...]:
+    queue_item = conn.execute(
+        "SELECT upstream_budget_id FROM queue_items WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if queue_item is None:
+        return ()
+    memberships = conn.execute(
+        """
+        SELECT budget_id
+        FROM queue_item_upstream_budgets
+        WHERE request_id=?
+        ORDER BY created_at, budget_id
+        """,
+        (request_id,),
+    ).fetchall()
+    budget_ids = [str(row["budget_id"]) for row in memberships]
+    primary_budget_id = queue_item["upstream_budget_id"]
+    if primary_budget_id is not None:
+        budget_ids.insert(0, str(primary_budget_id))
+    return tuple(dict.fromkeys(budget_ids))
+
+
+def _queue_item_upstream_budget_attempt_state_conn(
+    conn: sqlite3.Connection,
+    request_id: str,
+) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
+    queue_item = conn.execute(
+        "SELECT attempts_total FROM queue_items WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if queue_item is None:
+        return 0, (), ()
+    attempt_number = int(queue_item["attempts_total"])
+    memberships = conn.execute(
+        """
+        SELECT budget_id, last_charged_attempt
+        FROM queue_item_upstream_budgets
+        WHERE request_id=? AND first_attempt_number <= ?
+        ORDER BY created_at, budget_id
+        """,
+        (request_id, attempt_number),
+    ).fetchall()
+    budget_ids = tuple(str(row["budget_id"]) for row in memberships)
+    uncharged_budget_ids = tuple(
+        str(row["budget_id"])
+        for row in memberships
+        if int(row["last_charged_attempt"]) < attempt_number
+    )
+    return attempt_number, budget_ids, uncharged_budget_ids
+
+
+def _check_upstream_budget_deadlines_conn(
+    conn: sqlite3.Connection,
+    budget_ids: tuple[str, ...],
+    *,
+    current: datetime,
+) -> str | None:
+    for budget_id in budget_ids:
+        budget = conn.execute(
+            "SELECT deadline_at FROM upstream_request_budgets WHERE budget_id=?",
+            (budget_id,),
+        ).fetchone()
+        if budget is None:
+            return "request_budget_exceeded"
+        deadline_at = from_isoformat_or_none(budget["deadline_at"])
+        if deadline_at is not None and current >= deadline_at:
+            return "deadline_budget_exceeded"
+    return None
 
 
 @dataclass(frozen=True, slots=True)

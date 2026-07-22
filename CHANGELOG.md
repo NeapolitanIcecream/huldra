@@ -20,8 +20,9 @@
   bound, and random jitter only extends the wait.
 - Complete-window and backfill planning reject work before queue expansion when
   their request budgets cannot cover the initial plan.
-- Store schema advances to v7, adding durable upstream request budgets; normal
-  store initialization upgrades prior schemas in place.
+- Store schema advances to v8, adding durable upstream request budgets and
+  many-to-many queue budget membership; normal store initialization upgrades
+  prior schemas in place.
 
 ### Fixed
 
@@ -31,6 +32,10 @@
   and pages that make no progress.
 - Prevented a crash after the final OAI page checkpoint from refetching that
   page on restart.
+- Charged deduplicated queue work to every joined maintenance budget, including
+  atomic attempt reservation and deadline cleanup.
+- Made single-paper base-ID lookups use the same latest-version fallback as
+  batch ID lookups.
 
 ## 0.3.0 - 2026-07-17
 
