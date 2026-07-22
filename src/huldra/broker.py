@@ -714,7 +714,13 @@ class HuldraBroker:
             )
             for request in requests
         ]
-        initial_requests_total = sum(1 for _request, _key, cached in initial_plan if cached is None)
+        initial_requests_total = len(
+            {
+                cache_key
+                for _request, cache_key, cached in initial_plan
+                if cached is None
+            }
+        )
         if initial_requests_total > max_requests_total:
             raise ValueError(
                 f"maintenance plan exceeds request budget: "

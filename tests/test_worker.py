@@ -543,11 +543,11 @@ def test_swr_refreshes_once_only_after_persisted_refresh_deadline(
     assert reserved.refresh_after > now
 
 
-def test_swr_caller_can_request_a_shorter_refresh_interval(
+def test_joined_swr_refresh_uses_shortest_requested_interval(
     store: HuldraStore,
     settings: HuldraSettings,
 ) -> None:
-    completed_at = utc_now() - timedelta(minutes=2)
+    completed_at = utc_now() - timedelta(hours=2)
     cached_request = ArxivRequest(
         client_id="writer",
         search_query="cat:cs.AI",
@@ -560,18 +560,45 @@ def test_swr_caller_can_request_a_shorter_refresh_interval(
         papers=[make_paper()],
         completed_at=completed_at,
     )
-    refresh_request = cached_request.model_copy(
+    long_refresh = cached_request.model_copy(
         update={
-            "client_id": "reader",
+            "client_id": "slow-reader",
+            "cache_policy": CachePolicy.STALE_WHILE_REVALIDATE,
+        }
+    )
+    short_refresh = cached_request.model_copy(
+        update={
+            "client_id": "fast-reader",
             "cache_policy": CachePolicy.STALE_WHILE_REVALIDATE,
             "refresh_interval_seconds": 60,
         }
     )
+    later_longer_refresh = short_refresh.model_copy(
+        update={
+            "client_id": "later-reader",
+            "refresh_interval_seconds": 1800,
+        }
+    )
+    broker = HuldraBroker(store=store, settings=settings)
 
-    result = HuldraBroker(store=store, settings=settings).ensure(refresh_request)
+    first = broker.ensure(long_refresh)
+    second = broker.ensure(short_refresh)
+    third = broker.ensure(later_longer_refresh)
+    worker_result = HuldraWorker(
+        store,
+        settings,
+        fetcher=FakeFetcher([FetchResult([make_paper()], total_results=1)]),
+    ).run_once()
+    refreshed = store.get_cache_entry(key)
 
-    assert result.stale
-    assert result.request_id is not None
+    assert first.stale
+    assert first.request_id is not None
+    assert second.request_id == first.request_id
+    assert third.request_id == first.request_id
+    assert worker_result.status == "completed"
+    assert refreshed is not None
+    assert refreshed.completed_at is not None
+    assert refreshed.refresh_after == refreshed.completed_at + timedelta(seconds=60)
 
 
 def test_refresh_work_fetches_even_when_completed_cache_exists(

@@ -2013,10 +2013,22 @@ class HuldraStore:
         ).fetchone()
         if existing is not None:
             queue_item_changed = False
-            if (
-                work_kind == QueueWorkKind.REFRESH_COMPLETED
-                and existing["work_kind"] != QueueWorkKind.REFRESH_COMPLETED
-            ):
+            replacement_request: ArxivRequest | None = None
+            if work_kind == QueueWorkKind.REFRESH_COMPLETED:
+                if existing["work_kind"] != QueueWorkKind.REFRESH_COMPLETED:
+                    replacement_request = request
+                else:
+                    existing_request = _request_from_json(existing["request_json"])
+                    if (
+                        request.refresh_interval_seconds
+                        < existing_request.refresh_interval_seconds
+                    ):
+                        replacement_request = existing_request.model_copy(
+                            update={
+                                "refresh_interval_seconds": request.refresh_interval_seconds,
+                            }
+                        )
+            if replacement_request is not None:
                 conn.execute(
                     """
                     UPDATE queue_items
@@ -2025,7 +2037,7 @@ class HuldraStore:
                     """,
                     (
                         QueueWorkKind.REFRESH_COMPLETED,
-                        _request_json(request),
+                        _request_json(replacement_request),
                         now_s,
                         existing["request_id"],
                     ),

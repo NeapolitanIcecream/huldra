@@ -91,6 +91,33 @@ def test_complete_window_sync_fetches_all_contiguous_pages(
     assert [seen.start for seen in fetcher.seen] == [0, 1, 2]
 
 
+def test_complete_window_counts_duplicate_misses_as_one_request(
+    store: HuldraStore,
+    settings: HuldraSettings,
+) -> None:
+    request = ArxivRequest(client_id="first", search_query="cat:cs.AI", max_results=1)
+    duplicate = request.model_copy(update={"client_id": "second"})
+    fetcher = CapturingFetcher(
+        [FetchResult([make_paper("2401.00001v1")], total_results=1)],
+        [],
+    )
+
+    result = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request, duplicate],
+        wait=True,
+        wait_timeout_seconds=4,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+
+    assert result.requested_total == 2
+    assert result.completed_windows_total == 2
+    assert result.complete_windows_total == 2
+    assert result.upstream_requests_total == 1
+    assert len(fetcher.seen) == 1
+
+
 def test_complete_window_caps_atom_request_to_remaining_runtime(
     store: HuldraStore,
     settings: HuldraSettings,
