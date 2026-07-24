@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 - 2026-07-24
+
+### Fixed
+
+- Reclaimed maintenance queue items after their durable 429 cooldown or
+  transient backoff expired, instead of treating stale failed cache state as a
+  terminal result.
+- Preserved prompt maintenance handoff while a retry deadline is still in the
+  future and kept non-retryable failed queue items terminal.
+
 ## 0.4.0 - 2026-07-22
 
 ### Added

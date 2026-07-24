@@ -1539,11 +1539,19 @@ class HuldraBroker:
         if self.store.get_readable_completed_cache(target.cache_key) is not None:
             return True
         entry = self.store.get_cache_entry(target.cache_key)
+        item = (
+            self.store.get_queue_item(target.request_id)
+            if target.request_id is not None
+            else None
+        )
+        if item is not None and item.status in _PENDING_QUEUE_STATUSES:
+            if item.status != "delayed":
+                return False
+            if item.next_attempt_at is None or item.next_attempt_at <= utc_now():
+                return False
+            # A future retry deadline hands this bounded call back to the caller.
         if entry is not None and entry.status in {"failed", "rate_limited"}:
             return True
-        if target.request_id is None:
-            return False
-        item = self.store.get_queue_item(target.request_id)
         return _queue_item_has_terminal_outcome(item)
 
     def _finalize_maintenance_result(

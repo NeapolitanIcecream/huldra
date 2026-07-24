@@ -603,6 +603,63 @@ def test_complete_window_request_budget_caps_retried_upstream_attempts(
     assert entry.upstream_requests_total == 1
 
 
+def test_complete_window_retries_transient_queue_after_backoff_expires(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [datetime(2026, 7, 24, tzinfo=UTC)]
+    for module in (broker_module, db_module, limiter_module, worker_module):
+        monkeypatch.setattr(module, "utc_now", lambda: now[0])
+    request = ArxivRequest(client_id="demo", search_query="cat:cs.AI", max_results=1)
+    fetcher = CapturingFetcher(
+        [
+            TransientFetchError("temporary", status_code=500),
+            FetchResult([make_paper()], total_results=1),
+        ],
+        [],
+    )
+    original_item = store.enqueue_request(request)
+
+    first = HuldraWorker(store, settings, fetcher=fetcher).run_once()
+    delayed_item = store.get_queue_item(original_item.request_id)
+    first_entry = store.get_cache_entry(request_cache_key(request))
+    before_upstream_total = store.status_summary().upstream_requests_total
+
+    assert first.status == "transient_failure"
+    assert delayed_item is not None
+    assert delayed_item.status == "delayed"
+    assert delayed_item.next_attempt_at is not None
+    assert first_entry is not None
+    assert first_entry.status == "failed"
+    assert first_entry.upstream_requests_total == 1
+
+    now[0] = delayed_item.next_attempt_at + timedelta(microseconds=1)
+    retry = HuldraBroker(store=store, settings=settings, fetcher=fetcher).sync_windows(
+        [request],
+        wait=True,
+        wait_timeout_seconds=10,
+        mode=LegacySyncMode.COMPLETE_WINDOW,
+        max_pages_per_window=1,
+        max_requests_total=1,
+    )
+    retried_item = store.get_queue_item(original_item.request_id)
+    retried_entry = store.get_cache_entry(request_cache_key(request))
+
+    assert retry.completed_windows_total == 1
+    assert retry.complete_windows_total == 1
+    assert retry.upstream_requests_total == 1
+    assert retry.requests[0].raw_cache_status == "completed"
+    assert retry.requests[0].request_id == original_item.request_id
+    assert len(fetcher.seen) == 2
+    assert retried_item is not None
+    assert retried_item.status == "completed"
+    assert retried_entry is not None
+    assert retried_entry.status == "completed"
+    assert retried_entry.upstream_requests_total == 2
+    assert store.status_summary().upstream_requests_total == before_upstream_total + 1
+
+
 def test_complete_window_joined_queue_item_consumes_maintenance_budget(
     store: HuldraStore,
     settings: HuldraSettings,
