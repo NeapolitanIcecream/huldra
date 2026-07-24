@@ -5,10 +5,19 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+import huldra.broker as broker_module
+import huldra.db as db_module
+import huldra.limiter as limiter_module
+import huldra.worker as worker_module
 from huldra.broker import HuldraBroker
 from huldra.config import HuldraSettings
 from huldra.db import HuldraStore
-from huldra.fetcher import FetchResult, NonRetryableFetchError, RateLimitedError
+from huldra.fetcher import (
+    FetchResult,
+    NonRetryableFetchError,
+    RateLimitedError,
+    TransientFetchError,
+)
 from huldra.keys import request_cache_key
 from huldra.models import ArxivRequest, CachePolicy, CoverageStatus, RateState, ReadinessMode
 from huldra.planner import build_submitted_date_windows
@@ -199,6 +208,100 @@ def test_sync_windows_wait_reports_inline_429_retry_after(
     assert result.requests[0].raw_cache_status == "rate_limited"
 
 
+def test_sync_windows_retries_rate_limited_queue_after_cooldown_expires(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [datetime(2026, 7, 24, tzinfo=UTC)]
+    for module in (broker_module, db_module, limiter_module, worker_module):
+        monkeypatch.setattr(module, "utc_now", lambda: now[0])
+    target = ArxivRequest(
+        client_id="recoleta:test",
+        search_query="cat:cs.AI",
+        timeout_seconds=1,
+    )
+    cache_key = request_cache_key(target)
+    fetcher = FakeFetcher(
+        [
+            RateLimitedError(1),
+            FetchResult([make_paper()], total_results=1),
+        ]
+    )
+    broker = HuldraBroker(store=store, settings=settings, fetcher=fetcher)
+
+    first = broker.sync_windows([target], wait=True)
+    first_item = store.get_queue_item(first.requests[0].request_id or "")
+    first_entry = store.get_cache_entry(cache_key)
+
+    assert first_item is not None
+    assert first_item.status == "delayed"
+    assert first_entry is not None
+    assert first_entry.status == "rate_limited"
+    assert first_entry.upstream_requests_total == 1
+
+    now[0] += timedelta(seconds=settings.cooldown_seconds + 1)
+    retry = broker.sync_windows([target], wait=True)
+    retried_item = store.get_queue_item(first_item.request_id)
+    retried_entry = store.get_cache_entry(cache_key)
+
+    assert retry.completed_windows_total == 1
+    assert retry.upstream_requests_total == 1
+    assert fetcher.calls == 2
+    assert retried_item is not None
+    assert retried_item.status == "completed"
+    assert retried_entry is not None
+    assert retried_entry.status == "completed"
+    assert retried_entry.upstream_requests_total == 2
+
+
+def test_sync_windows_retries_transient_queue_after_backoff_expires(
+    store: HuldraStore,
+    settings: HuldraSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [datetime(2026, 7, 24, tzinfo=UTC)]
+    for module in (broker_module, db_module, limiter_module, worker_module):
+        monkeypatch.setattr(module, "utc_now", lambda: now[0])
+    target = ArxivRequest(
+        client_id="recoleta:test",
+        search_query="cat:cs.AI",
+        timeout_seconds=1,
+    )
+    cache_key = request_cache_key(target)
+    fetcher = FakeFetcher(
+        [
+            TransientFetchError("temporary", status_code=500),
+            FetchResult([make_paper()], total_results=1),
+        ]
+    )
+    broker = HuldraBroker(store=store, settings=settings, fetcher=fetcher)
+
+    first = broker.sync_windows([target], wait=True, wait_timeout_seconds=0.01)
+    first_item = store.get_queue_item(first.requests[0].request_id or "")
+    first_entry = store.get_cache_entry(cache_key)
+
+    assert first_item is not None
+    assert first_item.status == "delayed"
+    assert first_entry is not None
+    assert first_entry.status == "failed"
+    assert first_entry.upstream_requests_total == 1
+
+    now[0] += timedelta(seconds=6)
+    retry = broker.sync_windows([target], wait=True)
+    retried_item = store.get_queue_item(first_item.request_id)
+    retried_entry = store.get_cache_entry(cache_key)
+
+    assert retry.completed_windows_total == 1
+    assert retry.upstream_requests_total == 1
+    assert fetcher.calls == 2
+    assert retried_item is not None
+    assert retried_item.status == "completed"
+    assert retried_entry is not None
+    assert retried_entry.status == "completed"
+    assert retried_entry.upstream_requests_total == 2
+
+
 def test_sync_windows_wait_preserves_limiter_delay_between_inline_requests(
     store: HuldraStore,
     settings: HuldraSettings,
@@ -273,3 +376,7 @@ def test_sync_windows_wait_reports_failed_retry_for_unreadable_completed_cache(
     assert result.requests[0].raw_cache_status == "failed"
     assert result.requests[0].serving_status == "failed"
     assert result.requests[0].error_category == "non_retryable"
+    queue_item = store.get_queue_item(result.requests[0].request_id or "")
+    assert queue_item is not None
+    assert queue_item.status == "failed"
+    assert fetcher.calls == 1
