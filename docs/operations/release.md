@@ -1,7 +1,8 @@
 # Release
 
 Use this checklist to prepare a Huldra package release from a clean `main`
-checkout.
+checkout. Tagged distributions are published by GitHub Actions through PyPI
+Trusted Publishing; maintainers do not upload with a long-lived API token.
 
 ## Update Release Metadata
 
@@ -23,7 +24,6 @@ Run the local release gates:
 uv run ruff check .
 uv run pyright
 uv run pytest
-rm -rf dist
 uv build
 uv run --with twine twine check dist/*
 ```
@@ -38,17 +38,33 @@ uv pip install --python "$tmpdir/venv/bin/python" dist/*.whl
 rm -rf "$tmpdir"
 ```
 
+## One-Time Publisher Setup
+
+The PyPI project owner must configure the publisher before the first automated
+release:
+
+1. In the `huldra-arxiv` PyPI project, open **Publishing** and add a GitHub
+   Trusted Publisher.
+2. Set owner `NeapolitanIcecream`, repository `huldra`, workflow
+   `publish.yml`, and environment `pypi`.
+3. In the GitHub repository, create the `pypi` environment. Add a required
+   reviewer if releases should pause for human approval.
+
+If the PyPI project does not yet exist, create the same configuration as a
+pending publisher from the account's publishing settings.
+
 ## Tag And Publish
 
 Create an annotated tag after validation passes:
 
 ```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin main v0.1.0
+git tag -a v0.4.2 -m "Release v0.4.2"
+git push origin main v0.4.2
 ```
 
-Publish the built artifacts only after the tag is pushed:
+Create and publish the matching GitHub Release. The `Publish to PyPI` workflow
+then verifies that the tag, package version, and commit match; builds and checks
+the distributions; and publishes them from the protected `pypi` environment.
 
-```bash
-uv publish
-```
+The manual workflow is only for retrying an existing tag. Select that tag as
+the workflow ref and enter the same version without the `v` prefix.
