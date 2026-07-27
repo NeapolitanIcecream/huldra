@@ -1,7 +1,7 @@
 [project]
 name = "huldra-arxiv"
-version = "0.4.1"
-description = "Local-first arXiv metadata broker with shared cache, queue, and durable rate limiting."
+version = "0.4.2"
+description = "Shared arXiv metadata broker with a SQLite cache, queue, and durable upstream rate limits."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
@@ -33,8 +33,10 @@ dependencies = [
 
 [project.urls]
 Changelog = "https://github.com/NeapolitanIcecream/huldra/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/NeapolitanIcecream/huldra#readme"
 Issues = "https://github.com/NeapolitanIcecream/huldra/issues"
 Repository = "https://github.com/NeapolitanIcecream/huldra"
+Security = "https://github.com/NeapolitanIcecream/huldra/security/policy"
 
 [project.scripts]
 huldra = "huldra.cli:app"

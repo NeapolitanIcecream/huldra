@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 - 2026-07-27
+
+### Changed
+
+- Added a least-privilege GitHub Actions release path for publishing tagged
+  distributions through PyPI Trusted Publishing.
+- Clarified package metadata, release operations, and private vulnerability
+  reporting.
+
 ## 0.4.1 - 2026-07-24
 
 ### Fixed
