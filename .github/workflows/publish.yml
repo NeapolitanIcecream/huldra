@@ -31,6 +31,13 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           PACKAGE_VERSION="$(uv version --short)"
+          RUNTIME_VERSION="$(
+            uv run python -c 'from huldra import __version__; print(__version__)'
+          )"
+          if [[ "${RUNTIME_VERSION}" != "${PACKAGE_VERSION}" ]]; then
+            echo "Runtime version ${RUNTIME_VERSION} does not match package version ${PACKAGE_VERSION}" >&2
+            exit 1
+          fi
           if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
             EXPECTED_TAG="${RELEASE_TAG}"
           else
